@@ -56,6 +56,9 @@ export ANDROID_HOME=/path/to/sdk JAVA_HOME=/path/to/jdk17
 
 設定は `/data/adb/loadshift/profiles/<package>.conf`、統計は `/data/data/<package>/cache/loadshift/stats.txt` に書かれます。
 
+## ライセンス
+[MIT License](LICENSE)。root 権限でシステムやゲームの動作を変更するツールです。利用は自己責任でお願いします（ゲームの利用規約にも注意してください）。
+
 ## 検証
 `native/lab.cpp` はデバイス上で直接実行するテストです（`lab gles|glbuf|probe|probe2|occlgl|vk|vkidle|occlvk <libloadshift.so> <conf> <dir>`）。各機能の ON/OFF 比較と、結果の正確性（読み戻し比較）を確認します。
 
@@ -117,5 +120,8 @@ Settings are written to `/data/adb/loadshift/profiles/<package>.conf`, statistic
 
 ### Testing
 `native/lab.cpp` runs directly on the device (`lab gles|glbuf|probe|probe2|occlgl|vk|vkidle|occlvk <libloadshift.so> <conf> <dir>`) and compares each feature on/off and checks correctness by reading results back.
+
+### License
+[MIT License](LICENSE). This tool changes system and game behavior with root; use it at your own risk (and mind each game's terms of service).
 
 Third-party notices: see [THIRD_PARTY.md](THIRD_PARTY.md).
