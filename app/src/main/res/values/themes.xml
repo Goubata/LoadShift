@@ -1,0 +1,5 @@
+<resources>
+    <style name="Theme.LoadShift" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF0E0F12</item>
+    </style>
+</resources>

@@ -1,0 +1,13 @@
+# build outputs
+build/
+app/build/
+.gradle/
+.kotlin/
+*.apk
+*.zip
+native/*.spv
+# machine-specific
+local.properties
+build.env
+# research material (contains vendor binaries — never publish)
+research/
