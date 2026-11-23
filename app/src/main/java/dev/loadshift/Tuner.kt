@@ -249,6 +249,8 @@ object Tuner {
             append("vk_lazy_idle=${if (p.hookVkIdle) 1 else 0}\n")
             append("vk_idle_level=${p.vkIdleLevel}\n")
             append("vk_idle_depth=${p.vkIdleDepth}\n")
+            append("vk_pipeline_split=${p.pipeSplit}\n")
+            append("vk_mem_pool_mb=${p.memPoolMB}\n")
             append("compat_install=${p.compatInstall}\n")
             append("compat_timeout_ms=${p.compatTimeoutMs}\n")
             append("compat_exempt=${if (p.compatExempt) 1 else 0}\n")

@@ -1,6 +1,6 @@
 id=loadshift
 name=LoadShift
-version=0.5.0
-versionCode=5
+version=0.6.0
+versionCode=6
 author=LoadShift
 description=Per-app CPU→GPU offload: lazy Vulkan WaitIdle, GPU buffer copies, GPU texture conversion, async readback, non-blocking occlusion, flush coalescing, async glFinish, persistent pipeline cache.

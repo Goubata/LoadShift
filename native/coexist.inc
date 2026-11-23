@@ -249,8 +249,11 @@ static bool watch_changed() {
 // ---- caller classification -------------------------------------------------------------------
 
 struct Range { uintptr_t s, e; bool trusted; };
-static Range g_ranges[1024];
-static int g_nranges;
+// Two buffers: rescans fill the inactive one and then publish it, so readers never see a
+// half-written table. Ranges are sorted for binary search.
+static Range g_rbuf[2][1024];
+static std::atomic<int> g_ractive{0}, g_rcount{0};
+static std::atomic<uint64_t> g_rgen{0};
 static pthread_mutex_t g_rangeLock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_lastScan;
 static char g_exe[256];
@@ -263,9 +266,11 @@ static bool trusted_path(const char *p) {
     return false;
 }
 
-static void rescan_maps() {
+static void rescan_maps() {  // caller holds g_rangeLock
     FILE *f = fopen("/proc/self/maps", "re");
     if (!f) return;
+    int next = 1 - g_ractive.load();
+    Range *r = g_rbuf[next];
     char line[512];
     int n = 0;
     while (fgets(line, sizeof(line), f) && n < 1024) {
@@ -275,27 +280,48 @@ static void rescan_maps() {
         if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %n", &s, &e, perm, &path) < 3 || perm[2] != 'x') continue;
         char *p = line + path;
         p[strcspn(p, "\n")] = 0;
-        g_ranges[n++] = {s, e, trusted_path(p)};
+        r[n++] = {s, e, trusted_path(p)};
     }
     fclose(f);
-    g_nranges = n;
+    // /proc/self/maps is already sorted by address.
+    g_rcount = 0;            // readers fall back to "unknown" during the switch
+    g_ractive = next;
+    g_rcount = n;
+    g_rgen++;
 }
 
 // Also treat our own library as trusted (it may be mapped from a memfd by the Zygisk loader).
 static uintptr_t g_selfS, g_selfE;
-
 static uintptr_t g_lastUnknown;
+struct TlsHit { uintptr_t s, e; uint64_t gen; bool trusted; };
+static thread_local TlsHit t_hit;
+
+static int lookup(uintptr_t a) {  // 1 trusted, 0 foreign, -1 unknown
+    if (t_hit.gen == g_rgen.load() && a >= t_hit.s && a < t_hit.e) return t_hit.trusted ? 1 : 0;
+    const Range *r = g_rbuf[g_ractive.load()];
+    int lo = 0, hi = g_rcount.load() - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (a < r[mid].s) hi = mid - 1;
+        else if (a >= r[mid].e) lo = mid + 1;
+        else {
+            t_hit = {r[mid].s, r[mid].e, g_rgen.load(), r[mid].trusted};
+            return r[mid].trusted ? 1 : 0;
+        }
+    }
+    return -1;
+}
 
 static bool foreign_caller(void *ra) {
     uintptr_t a = (uintptr_t)ra;
     if (!g_exempt || !g_compat) return false;
     if (a >= g_selfS && a < g_selfE) return false;
     for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < g_nranges; i++)
-            if (a >= g_ranges[i].s && a < g_ranges[i].e) {
-                if (!g_ranges[i].trusted) st_foreignCalls++;
-                return !g_ranges[i].trusted;
-            }
+        int k = lookup(a);
+        if (k >= 0) {
+            if (!k) st_foreignCalls++;
+            return !k;
+        }
         // Code we have not seen yet (newly loaded library or newly mapped code): re-read the
         // maps right away, but not repeatedly for the same unknown address.
         uint64_t now = now_ns();
@@ -326,7 +352,9 @@ static void init_callers() {
         }
         if (f) fclose(f);
     }
+    pthread_mutex_lock(&g_rangeLock);
     rescan_maps();
+    pthread_mutex_unlock(&g_rangeLock);
     g_lastScan = now_ns();
 }
 

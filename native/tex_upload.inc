@@ -41,13 +41,16 @@ static void *worker(void *arg) {
 static void start_pool() {
     if (g_poolStarted) return;
     g_poolStarted = true;
+    int started = 0;
     for (int i = 0; i < kWorkers; i++) {
         pthread_t t;
         pthread_attr_t at;
         pthread_attr_init(&at);
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-        pthread_create(&t, &at, worker, (void *)(intptr_t)i);
+        if (pthread_create(&t, &at, worker, (void *)(intptr_t)i)) break;
+        started++;
     }
+    kWorkers = started;  // never wait for helpers that do not exist
 }
 
 static pthread_mutex_t g_copyLock = PTHREAD_MUTEX_INITIALIZER;  // one parallel copy at a time
@@ -55,6 +58,7 @@ static pthread_mutex_t g_copyLock = PTHREAD_MUTEX_INITIALIZER;  // one parallel 
 static void fast_copy(void *dst, const void *src, size_t len) {
     if (kWorkers <= 0 || len < g_copyThreshold || pthread_mutex_trylock(&g_copyLock)) { memcpy(dst, src, len); return; }
     start_pool();
+    if (kWorkers <= 0) { pthread_mutex_unlock(&g_copyLock); memcpy(dst, src, len); return; }
     int parts = kWorkers + 1;
     size_t part = (len / parts + 4095) & ~(size_t)4095;
     pthread_mutex_lock(&g_poolLock);

@@ -70,6 +70,8 @@ struct Config {
     int compatTimeoutMs = 3000;
     bool foreignFg = false;   // set by the companion: another graphics hook module is active
     bool exemptForeign = true;
+    int pipeSplit = 4;        // threads for splitting batched pipeline creation (0/1 = off)
+    int memPoolMB = 0;        // VkDeviceMemory recycling pool size, 0 = off
 };
 static Config cfg;
 static char g_dir[512];   // <app data>/cache/loadshift
@@ -123,6 +125,8 @@ static void parse_config(const char *text) {
                 else if (!strcmp(line, "compat_timeout_ms")) cfg.compatTimeoutMs = v < 200 ? 200 : (v > 30000 ? 30000 : v);
                 else if (!strcmp(line, "foreign_fg")) cfg.foreignFg = v;
                 else if (!strcmp(line, "compat_exempt")) cfg.exemptForeign = v;
+                else if (!strcmp(line, "vk_pipeline_split")) cfg.pipeSplit = v < 0 ? 0 : (v > 8 ? 8 : v);
+                else if (!strcmp(line, "vk_mem_pool_mb")) cfg.memPoolMB = v < 0 ? 0 : (v > 1024 ? 1024 : v);
                 else if (!strcmp(line, "gl_buffer_min")) cfg.glBufMin = v < 0 ? 0 : v;
             }
         }
@@ -150,7 +154,7 @@ static bool write_atomic(const char *name, const void *data, size_t len) {
 
 static int extra_stats(char *b, size_t cap);
 static void write_stats() {
-    char b[4000];
+    char b[5000];
     uint64_t f = st_finish.load(), pipes = st_vkPipes.load();
     int n = snprintf(b, sizeof(b),
         "pkg=%s\npid=%d\nhooks=%s\n"
@@ -165,7 +169,11 @@ static void write_stats() {
         (unsigned long long)st_vkImplicit.load(), (unsigned long long)st_vkSeeded.load(),
         (unsigned long long)st_vkLoaded.load() / 1024, (unsigned long long)st_vkSaved.load() / 1024,
         (long)time(nullptr));
-    if (n > 0 && n < (int)sizeof(b)) n += extra_stats(b + n, sizeof(b) - n);
+    if (n < 0) return;
+    if (n >= (int)sizeof(b)) n = sizeof(b) - 1;
+    int e = extra_stats(b + n, sizeof(b) - n);
+    if (e > 0) n += e;
+    if (n >= (int)sizeof(b)) n = sizeof(b) - 1;
     write_atomic("stats.txt", b, n);
 }
 
@@ -527,6 +535,8 @@ static Implicit g_impl[8];
 struct AppCache { VkDevice dev; VkPipelineCache cache; };
 static AppCache g_appCaches[64];
 static std::atomic<uint64_t> st_vkAppCaches{0}, st_vkInjected{0}, st_vkMerges{0};
+// Caches the app created with EXTERNALLY_SYNCHRONIZED: never used from several threads at once.
+static VkPipelineCache g_extCaches[32];
 static uint8_t *g_blob;
 static size_t g_blobSize;
 
@@ -622,6 +632,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_CreatePipelineCache(VkDevice d, const V
         if (master && o_MergePipelineCaches(d, *out, 1, &master) == VK_SUCCESS) st_vkInjected++;
         pthread_mutex_unlock(&g_vkLock);
     }
+    if (ci->flags & VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT) {
+        pthread_mutex_lock(&g_vkLock);
+        for (auto &c : g_extCaches) if (!c) { c = *out; break; }
+        pthread_mutex_unlock(&g_vkLock);
+    }
     // Remember it as a merge source, unless the app promised to synchronize it itself.
     if (!(ci->flags & VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT)) {
         pthread_mutex_lock(&g_vkLock);
@@ -644,11 +659,125 @@ static VKAPI_ATTR void VKAPI_CALL my_DestroyPipelineCache(VkDevice d, VkPipeline
     o_DestroyPipelineCache(d, c, a);
 }
 
+// ---- parallel pipeline compilation -------------------------------------------------------------
+// The Adreno driver compiles the pipelines of one vkCreate*Pipelines call one after another
+// (measured: 48 pipelines 500 ms in one call vs 190 ms split over 4 threads). Batches are split
+// into chunks that worker threads hand to the driver concurrently.
+namespace psplit {
+struct Job {
+    bool graphics;
+    VkDevice dev;
+    VkPipelineCache cache;
+    uint32_t n;
+    const void *ci;
+    const VkAllocationCallbacks *alloc;
+    VkPipeline *out;
+    VkResult result;
+    bool done;
+};
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER, g_doneCv = PTHREAD_COND_INITIALIZER;
+static Job *g_queue[64];
+static int g_qn, g_started;
+static std::atomic<uint64_t> st_splitCalls{0}, st_splitPipes{0};
+
+static VkResult run(Job &j) {
+    return j.graphics ? o_CreateGraphicsPipelines(j.dev, j.cache, j.n, (const VkGraphicsPipelineCreateInfo *)j.ci, j.alloc, j.out)
+                      : o_CreateComputePipelines(j.dev, j.cache, j.n, (const VkComputePipelineCreateInfo *)j.ci, j.alloc, j.out);
+}
+
+static void *worker(void *) {
+    pthread_setname_np(pthread_self(), "LoadShiftPSO");
+    for (;;) {
+        pthread_mutex_lock(&g_lock);
+        while (!g_qn) pthread_cond_wait(&g_cv, &g_lock);
+        Job *j = g_queue[--g_qn];
+        pthread_mutex_unlock(&g_lock);
+        VkResult r = run(*j);
+        pthread_mutex_lock(&g_lock);
+        j->result = r;
+        j->done = true;
+        pthread_cond_broadcast(&g_doneCv);
+        pthread_mutex_unlock(&g_lock);
+    }
+    return nullptr;
+}
+
+static bool cache_splittable(VkDevice d, VkPipelineCache c) {
+    pthread_mutex_lock(&g_vkLock);
+    bool ok = false;
+    for (auto &i : g_impl) if (i.dev == d && i.cache == c) ok = true;  // our master
+    for (auto &x : g_appCaches) if (x.cache == c) ok = true;            // seen created, internally synced
+    for (auto &x : g_extCaches) if (x == c) ok = false;
+    pthread_mutex_unlock(&g_vkLock);
+    return ok;
+}
+
+template <class CI>
+static bool splittable(VkDevice d, VkPipelineCache c, uint32_t n, const CI *ci) {
+    if (cfg.pipeSplit < 2 || n < 2 || (c && !cache_splittable(d, c))) return false;
+    for (uint32_t i = 0; i < n; i++) {
+        if ((ci[i].flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT) && ci[i].basePipelineIndex >= 0) return false;
+        if (ci[i].flags & 0x200 /*EARLY_RETURN_ON_FAILURE*/) return false;
+    }
+    return true;
+}
+
+// Splits into up to cfg.pipeSplit chunks; the calling thread compiles the first chunk itself.
+template <class CI>
+static VkResult create(bool graphics, VkDevice d, VkPipelineCache c, uint32_t n, const CI *ci,
+                       const VkAllocationCallbacks *a, VkPipeline *out) {
+    uint32_t k = (uint32_t)cfg.pipeSplit < n ? (uint32_t)cfg.pipeSplit : n;
+    Job jobs[8];
+    uint32_t per = (n + k - 1) / k, at = 0, nj = 0;
+    for (uint32_t i = 0; i < k && at < n; i++) {
+        uint32_t cnt = n - at < per ? n - at : per;
+        jobs[nj++] = {graphics, d, c, cnt, ci + at, a, out + at, VK_SUCCESS, false};
+        at += cnt;
+    }
+    pthread_mutex_lock(&g_lock);
+    while (g_started < cfg.pipeSplit - 1) {
+        pthread_t t;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &attr, worker, nullptr)) break;
+        g_started++;
+    }
+    uint32_t queued = 1;
+    if (g_started > 0)  // without workers everything runs on the calling thread below
+        for (uint32_t i = 1; i < nj && g_qn < 64; i++, queued++) g_queue[g_qn++] = &jobs[i];
+    pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_lock);
+    for (uint32_t i = queued; i < nj; i++) { jobs[i].result = run(jobs[i]); jobs[i].done = true; }  // queue full
+    jobs[0].result = run(jobs[0]);
+    jobs[0].done = true;
+    pthread_mutex_lock(&g_lock);
+    for (;;) {
+        bool all = true;
+        for (uint32_t i = 1; i < nj; i++) if (!jobs[i].done) all = false;
+        if (all) break;
+        pthread_cond_wait(&g_doneCv, &g_lock);
+    }
+    pthread_mutex_unlock(&g_lock);
+    // Errors (negative) win over positive non-success codes, which win over success.
+    VkResult r = VK_SUCCESS;
+    for (uint32_t i = 0; i < nj; i++) {
+        if (jobs[i].result < 0 && (r >= 0 || jobs[i].result < r)) r = jobs[i].result;
+        else if (jobs[i].result > 0 && r == VK_SUCCESS) r = jobs[i].result;
+    }
+    st_splitCalls++;
+    st_splitPipes += n;
+    return r;
+}
+}  // namespace psplit
+
 static VKAPI_ATTR VkResult VKAPI_CALL my_CreateGraphicsPipelines(VkDevice d, VkPipelineCache c, uint32_t n,
         const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     if (!c) c = implicit_cache(d);
     uint64_t t0 = now_ns();
-    VkResult r = o_CreateGraphicsPipelines(d, c, n, ci, a, out);
+    VkResult r = psplit::splittable(d, c, n, ci) ? psplit::create(true, d, c, n, ci, a, out)
+                                                 : o_CreateGraphicsPipelines(d, c, n, ci, a, out);
     st_vkPipeNs += now_ns() - t0;
     st_vkPipes += n;
     g_dirty = true;
@@ -659,7 +788,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_CreateComputePipelines(VkDevice d, VkPi
         const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     if (!c) c = implicit_cache(d);
     uint64_t t0 = now_ns();
-    VkResult r = o_CreateComputePipelines(d, c, n, ci, a, out);
+    VkResult r = psplit::splittable(d, c, n, ci) ? psplit::create(false, d, c, n, ci, a, out)
+                                                 : o_CreateComputePipelines(d, c, n, ci, a, out);
     st_vkPipeNs += now_ns() - t0;
     st_vkPipes += n;
     g_dirty = true;
@@ -667,9 +797,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_CreateComputePipelines(VkDevice d, VkPi
 }
 
 #include "vk_idle.inc"
+#include "vk_mempool.inc"
 
 static VKAPI_ATTR void VKAPI_CALL my_DestroyDevice(VkDevice d, const VkAllocationCallbacks *a) {
-    if (cfg.vkIdle) vkidle::device_teardown(d);
+    if (cfg.vkIdle) vkidle::device_teardown(d);   // runs deferred frees (into the pool)
+    if (mempool::g_cap) mempool::teardown(d);
     pthread_mutex_lock(&g_vkLock);
     if (cfg.vkCache) {
         bool any = false;
@@ -726,9 +858,10 @@ static int install_vulkan(char *log, size_t cap) {
     o_DestroyDevice = (PFN_vkDestroyDevice)a[5];
     int idle = 0;
     if (cfg.vkIdle || cfg.occl) idle = vkidle::install(drv, cfg.vkIdleLevel, cfg.vkIdleDepth, cfg.vkIdle, cfg.occl);
+    int mp = mempool::install(drv, (size_t)cfg.memPoolMB << 20, cfg.vkIdle && idle > 0);
     coexist::g_vkCopies = coexist::count_loaded("vulkan.adreno.so");
     int nd = vkH(drv, a[5], (void *)my_DestroyDevice, (void **)&o_DestroyDevice);
-    if (!cfg.vkCache) { snprintf(log, cap, "vk:idle%d,dd%d ", idle, nd); return idle + nd; }
+    if (!cfg.vkCache) { snprintf(log, cap, "vk:idle%d,pool%d,dd%d ", idle, mp, nd); return idle + mp + nd; }
     o_CreatePipelineCache = (PFN_vkCreatePipelineCache)a[0];
     o_DestroyPipelineCache = (PFN_vkDestroyPipelineCache)a[1];
     o_GetPipelineCacheData = (PFN_vkGetPipelineCacheData)a[2];
@@ -739,7 +872,7 @@ static int install_vulkan(char *log, size_t cap) {
     int n1 = vkH(drv, a[1], (void *)my_DestroyPipelineCache, (void **)&o_DestroyPipelineCache);
     int n3 = vkH(drv, a[3], (void *)my_CreateGraphicsPipelines, (void **)&o_CreateGraphicsPipelines);
     int n4 = vkH(drv, a[4], (void *)my_CreateComputePipelines, (void **)&o_CreateComputePipelines);
-    snprintf(log, cap, "vk:cache%d%d%d%d%s,idle%d,dd%d ", n0, n1, n3, n4, o_MergePipelineCaches ? "+merge" : "", idle, nd);
+    snprintf(log, cap, "vk:cache%d%d%d%d%s,idle%d,pool%d,dd%d ", n0, n1, n3, n4, o_MergePipelineCaches ? "+merge" : "", idle, mp, nd);
     return n0 + n1 + n3 + n4 + nd + (idle > 0 ? idle : 0);
 }
 
@@ -762,7 +895,7 @@ static std::atomic<bool> g_hooksReady{false};
 static void do_install(bool mayLoadDriver) {
     char a[128] = "", b[128] = "";
     if (cfg.glFinish || cfg.pbo || cfg.glBuf || cfg.occl || cfg.readback || cfg.flushUs) install_gles(a, sizeof(a), mayLoadDriver);
-    if (cfg.vkCache || cfg.vkIdle || cfg.occl) install_vulkan(b, sizeof(b));
+    if (cfg.vkCache || cfg.vkIdle || cfg.occl || cfg.memPoolMB) install_vulkan(b, sizeof(b));
     snprintf(st_hooks, sizeof(st_hooks), "%s%s", a, b);
     LOG("%s: %s [%s]", g_pkg, st_hooks, coexist::g_mode);
     g_hooksReady = true;
@@ -868,8 +1001,12 @@ static void install(const char *dataDir) {
 
 static int extra_stats(char *b, size_t cap) {
     return snprintf(b, cap,
-        "compat=%s\nforeign_module=%d\nforeign_slots=%llu\nyielded_slots=%llu\nforeign_calls=%llu\ndriver_copies=vk%d/gl%d\nvk_app_caches=%llu\nvk_cache_injected=%llu\nvk_cache_merges=%llu\ngl_tex_compressed=%llu\ngl_buf_sub=%llu\ngl_buf_sub_mb=%.1f\ngl_buf_map=%llu\ngl_buf_map_mb=%.1f\ngl_buf_fallback=%llu\n"
+        "vk_mem_pool_hits=%llu\nvk_mem_pool_misses=%llu\nvk_mem_pooled=%llu\nvk_mem_trimmed=%llu\nvk_mem_saved_mb=%.1f\nvk_mem_pool_now_mb=%.1f\nvk_split_calls=%llu\nvk_split_pipelines=%llu\ncompat=%s\nforeign_module=%d\nforeign_slots=%llu\nyielded_slots=%llu\nforeign_calls=%llu\ndriver_copies=vk%d/gl%d\nvk_app_caches=%llu\nvk_cache_injected=%llu\nvk_cache_merges=%llu\ngl_tex_compressed=%llu\ngl_buf_sub=%llu\ngl_buf_sub_mb=%.1f\ngl_buf_map=%llu\ngl_buf_map_mb=%.1f\ngl_buf_fallback=%llu\n"
         "gl_readback_async=%llu\ngl_readback_exact=%llu\ngl_flush_dropped=%llu\ngl_flush_real=%llu\noccl_gl_answered=%llu\noccl_vk_answered=%llu\nvk_idle_skipped=%llu\nvk_idle_native_ms=%.1f\nvk_lazy_waits=%llu\nvk_lazy_wait_ms=%.1f\nvk_deferred_destroys=%llu\n",
+        (unsigned long long)mempool::st_hits.load(), (unsigned long long)mempool::st_misses.load(),
+        (unsigned long long)mempool::st_pooled.load(), (unsigned long long)mempool::st_trimmed.load(),
+        mempool::st_savedBytes.load() / 1048576.0, mempool::g_bytes / 1048576.0,
+        (unsigned long long)psplit::st_splitCalls.load(), (unsigned long long)psplit::st_splitPipes.load(),
         coexist::g_mode, cfg.foreignFg ? 1 : 0, (unsigned long long)coexist::st_foreignSlots.load(),
         (unsigned long long)coexist::st_yielded.load(), (unsigned long long)coexist::st_foreignCalls.load(), coexist::g_vkCopies, coexist::g_glCopies,
         (unsigned long long)st_vkAppCaches.load(), (unsigned long long)st_vkInjected.load(), (unsigned long long)st_vkMerges.load(),
@@ -989,7 +1126,7 @@ public:
             close(s);
         }
         if (len) parse_config(conf);
-        selected = len && cfg.enabled && (cfg.glFinish || cfg.pbo || cfg.vkCache || cfg.vkIdle || cfg.glBuf || cfg.occl || cfg.readback || cfg.flushUs);
+        selected = len && cfg.enabled && (cfg.glFinish || cfg.pbo || cfg.vkCache || cfg.vkIdle || cfg.glBuf || cfg.occl || cfg.readback || cfg.flushUs || cfg.memPoolMB);
         if (selected) snprintf(g_pkg, sizeof(g_pkg), "%s", pkg);
         else api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }

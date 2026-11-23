@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <atomic>
 // On-device lab for LoadShift hooks (runs as a plain native process, no Zygisk).
 // usage: lab <gles|vk> <libloadshift.so> <conf-file> <data-dir>
@@ -926,6 +927,267 @@ static int coexist_test(const char *conf, const char *dir) {
     return ok ? 0 : 1;
 }
 
+// Exploration for new offloads: redundant state, parallel shader compile, submit batching.
+static int probe3_test(const char *conf, const char *dir) {
+    EGLDisplay d = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(d, nullptr, nullptr);
+    printf("hooks: %s\n", lab_install(conf, dir, "lab.probe3"));
+    EGLint ca[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE};
+    EGLConfig c; EGLint n;
+    eglChooseConfig(d, ca, &c, 1, &n);
+    EGLint sa[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
+    EGLSurface s = eglCreatePbufferSurface(d, c, sa);
+    EGLint xa[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    EGLContext x = eglCreateContext(d, c, EGL_NO_CONTEXT, xa);
+    eglMakeCurrent(d, s, s, x);
+    const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+    printf("parallel_shader_compile: %s\n", strstr(ext, "GL_KHR_parallel_shader_compile") ? "yes" : "no");
+    GLuint p = prog("#version 300 es\nvoid main(){gl_Position=vec4(0);}", "#version 300 es\nprecision mediump float;uniform vec4 u;out vec4 o;void main(){o=u;}");
+    GLuint p2 = prog("#version 300 es\nvoid main(){gl_Position=vec4(0);}", "#version 300 es\nprecision mediump float;uniform vec4 u;out vec4 o;void main(){o=u*2.;}");
+    GLint lu = glGetUniformLocation(p, "u");
+    GLuint t[2]; glGenTextures(2, t);
+    const int N = 200000;
+    double t0;
+    glFinish();
+    t0 = ms(); for (int i = 0; i < N; i++) glUseProgram(p); double useSame = ms() - t0;
+    t0 = ms(); for (int i = 0; i < N; i++) glUseProgram(i & 1 ? p : p2); double useAlt = ms() - t0;
+    glUseProgram(p);
+    t0 = ms(); for (int i = 0; i < N; i++) glUniform4f(lu, 1, 2, 3, 4); double uniSame = ms() - t0;
+    t0 = ms(); for (int i = 0; i < N; i++) glUniform4f(lu, (float)i, 2, 3, 4); double uniDiff = ms() - t0;
+    t0 = ms(); for (int i = 0; i < N; i++) glBindTexture(GL_TEXTURE_2D, t[0]); double texSame = ms() - t0;
+    t0 = ms(); for (int i = 0; i < N; i++) glEnable(GL_BLEND); double enSame = ms() - t0;
+    t0 = ms(); for (int i = 0; i < N; i++) glBlendFunc(GL_ONE, GL_ONE); double bfSame = ms() - t0;
+    t0 = ms(); for (int i = 0; i < N; i++) glViewport(0, 0, 16, 16); double vpSame = ms() - t0;
+    glFinish();
+    printf("redundant us/call: UseProgram same %.3f (alternating %.3f), Uniform4f same %.3f (changing %.3f), BindTexture same %.3f, Enable same %.3f, BlendFunc same %.3f, Viewport same %.3f\n",
+           useSame * 1000 / N, useAlt * 1000 / N, uniSame * 1000 / N, uniDiff * 1000 / N, texSame * 1000 / N, enSame * 1000 / N, bfSame * 1000 / N, vpSame * 1000 / N);
+    // draw call cost with redundant state vs without (typical engine pattern)
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    t0 = ms();
+    for (int i = 0; i < 20000; i++) { glUseProgram(p); glUniform4f(lu, 1, 2, 3, 4); glBindTexture(GL_TEXTURE_2D, t[0]); glEnable(GL_BLEND); glDrawArrays(GL_TRIANGLES, 0, 0); }
+    double drawRed = ms() - t0;
+    glFinish();
+    t0 = ms();
+    for (int i = 0; i < 20000; i++) glDrawArrays(GL_TRIANGLES, 0, 0);
+    double drawOnly = ms() - t0;
+    glFinish();
+    printf("draw+4 redundant state: %.3f us/draw, draw only %.3f us/draw\n", drawRed * 1000 / 20000, drawOnly * 1000 / 20000);
+
+    // shader compile: sequential (status after each link) vs parallel (link all, then status)
+    char fs[512];
+    auto mk = [&](int i) {
+        snprintf(fs, sizeof(fs), "#version 300 es\nprecision highp float;out vec4 o;uniform vec4 u;void main(){vec4 a=u;for(int k=0;k<%d;k++)a=sin(a*%d.13+vec4(k));o=a;}", 20 + i % 17, i + 3);
+        GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+        const char *vs = "#version 300 es\nvoid main(){gl_Position=vec4(0);}";
+        const char *fp = fs;
+        glShaderSource(v, 1, &vs, nullptr); glShaderSource(f, 1, &fp, nullptr);
+        glCompileShader(v); glCompileShader(f);
+        GLuint pr = glCreateProgram(); glAttachShader(pr, v); glAttachShader(pr, f); glLinkProgram(pr);
+        return pr;
+    };
+    const int P = 40;
+    GLint st;
+    t0 = ms();
+    for (int i = 0; i < P; i++) { GLuint pr = mk(1000 + i * 7); glGetProgramiv(pr, GL_LINK_STATUS, &st); }
+    double seq = ms() - t0;
+    auto maxThreads = (void (*)(GLuint))eglGetProcAddress("glMaxShaderCompilerThreadsKHR");
+    if (maxThreads) maxThreads(0xFFFFFFFF);
+    GLuint prs[P];
+    t0 = ms();
+    for (int i = 0; i < P; i++) prs[i] = mk(5000 + i * 7);
+    double issue = ms() - t0;
+    for (int i = 0; i < P; i++) glGetProgramiv(prs[i], GL_LINK_STATUS, &st);
+    double par = ms() - t0;
+    printf("shader link x%d: sequential %.1f ms, parallel-threads issue %.1f ms / all done %.1f ms (status=%d)\n", P, seq, issue, par, st);
+    eglMakeCurrent(d, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglTerminate(d);
+
+    // Vulkan submit cost
+    VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO}; ai.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &ai;
+    VkInstance inst; vkCreateInstance(&ici, nullptr, &inst);
+    uint32_t pc = 1; VkPhysicalDevice pd; vkEnumeratePhysicalDevices(inst, &pc, &pd);
+    float prio = 1;
+    VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qi;
+    VkDevice dev; vkCreateDevice(pd, &dci, nullptr, &dev);
+    VkQueue q; vkGetDeviceQueue(dev, 0, 0, &q);
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool pool; vkCreateCommandPool(dev, &cpi, nullptr, &pool);
+    const int C = 200;
+    VkCommandBuffer cbs[C];
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cai.commandPool = pool; cai.commandBufferCount = C;
+    vkAllocateCommandBuffers(dev, &cai, cbs);
+    for (int i = 0; i < C; i++) {
+        VkCommandBufferBeginInfo bb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bb.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+        vkBeginCommandBuffer(cbs[i], &bb); vkEndCommandBuffer(cbs[i]);
+    }
+    vkQueueWaitIdle(q);
+    t0 = ms();
+    for (int i = 0; i < C; i++) { VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cbs[i]; vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE); }
+    double sep = ms() - t0;
+    vkQueueWaitIdle(q);
+    t0 = ms();
+    { VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = C; si.pCommandBuffers = cbs; vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE); }
+    double one = ms() - t0;
+    vkQueueWaitIdle(q);
+    printf("vkQueueSubmit: %d separate %.1f us each, one batched %.1f us total\n", C, sep * 1000 / C, one * 1000);
+    vkDestroyCommandPool(dev, pool, nullptr);
+    vkDestroyDevice(dev, nullptr);
+    vkDestroyInstance(inst, nullptr);
+    return 0;
+}
+
+// Batched pipeline creation: one call with N vs the same N split across worker threads.
+static int probe4_test(const char *conf, const char *dir) {
+    printf("hooks: %s\n", lab_install(conf, dir, "lab.probe4"));
+    VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO}; ai.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &ai;
+    VkInstance inst; vkCreateInstance(&ici, nullptr, &inst);
+    uint32_t pc = 1; VkPhysicalDevice pd; vkEnumeratePhysicalDevices(inst, &pc, &pd);
+    float prio = 1;
+    VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qi;
+    VkDevice dev; vkCreateDevice(pd, &dci, nullptr, &dev);
+    VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; sci.codeSize = sizeof(lab_comp_spv); sci.pCode = lab_comp_spv;
+    VkShaderModule sm; vkCreateShaderModule(dev, &sci, nullptr, &sm);
+    VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dl.bindingCount = 1; dl.pBindings = &b;
+    VkDescriptorSetLayout dsl; vkCreateDescriptorSetLayout(dev, &dl, nullptr, &dsl);
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pl.setLayoutCount = 1; pl.pSetLayouts = &dsl;
+    VkPipelineLayout layout; vkCreatePipelineLayout(dev, &pl, nullptr, &layout);
+    const int N = 48;
+    static int32_t spec[3][N][2];
+    static VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    static VkSpecializationInfo si[3][N];
+    static VkComputePipelineCreateInfo cp[3][N];
+    for (int r = 0; r < 3; r++)
+        for (int i = 0; i < N; i++) {
+            spec[r][i][0] = 100000 * (r + 1) + i * 37 + (int)(time(nullptr) % 1000) * 1000; spec[r][i][1] = i % 7 + 3;
+            si[r][i] = {2, me, 8, spec[r][i]};
+            cp[r][i] = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            cp[r][i].stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", &si[r][i]};
+            cp[r][i].layout = layout;
+        }
+    VkPipeline out[N];
+    double t0 = ms();
+    VkResult rb = vkCreateComputePipelines(dev, VK_NULL_HANDLE, N, cp[0], nullptr, out);
+    double batched = ms() - t0;
+    int bn = 0;
+    for (int i = 0; i < N; i++) if (!out[i]) bn++;
+    printf("batched result=%d null=%d\n", rb, bn);
+    t0 = ms();
+    for (int i = 0; i < N; i++) vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cp[1][i], nullptr, &out[i]);
+    double single = ms() - t0;
+    t0 = ms();
+    struct Job { VkDevice dev; const VkComputePipelineCreateInfo *ci; VkPipeline *out; int n; };
+    static Job jobs[4];
+    pthread_t th[4];
+    for (int k = 0; k < 4; k++) {
+        jobs[k] = {dev, &cp[2][k * N / 4], &out[k * N / 4], N / 4};
+        pthread_create(&th[k], nullptr, [](void *a) -> void * {
+            Job *j = (Job *)a;
+            vkCreateComputePipelines(j->dev, VK_NULL_HANDLE, j->n, j->ci, nullptr, j->out);
+            return nullptr;
+        }, &jobs[k]);
+    }
+    for (auto &t : th) pthread_join(t, nullptr);
+    double split = ms() - t0;
+    int nulls = 0;
+    for (int i = 0; i < N; i++) if (!out[i]) nulls++;
+    printf("pipelines x%d: one batched call %.1f ms, %d single calls %.1f ms, split over 4 threads %.1f ms, null handles %d\n", N, batched, N, single, split, nulls);
+    vkDestroyDevice(dev, nullptr);
+    vkDestroyInstance(inst, nullptr);
+    return 0;
+}
+
+// Memory allocation churn and descriptor update costs.
+static int probe5_test(const char *conf, const char *dir) {
+    printf("hooks: %s\n", lab_install(conf, dir, "lab.probe5"));
+    VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO}; ai.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &ai;
+    VkInstance inst; vkCreateInstance(&ici, nullptr, &inst);
+    uint32_t pc = 1; VkPhysicalDevice pd; vkEnumeratePhysicalDevices(inst, &pc, &pd);
+    float prio = 1;
+    VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qi;
+    VkDevice dev; vkCreateDevice(pd, &dci, nullptr, &dev);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    uint32_t host = 0, local = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        auto f = mp.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && !host) host = i;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !local) local = i;
+    }
+    const int R = 300;
+    uint32_t sizes[] = {64 << 10, 1 << 20, 8 << 20};
+    for (uint32_t sz : sizes)
+        for (uint32_t ty2 = 0; ty2 < 2; ty2++) {
+            uint32_t ty = ty2 ? local : host;
+            double a = 0, f = 0;
+            for (int i = 0; i < R; i++) {
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = sz; mai.memoryTypeIndex = ty;
+                VkDeviceMemory m;
+                double t0 = ms(); vkAllocateMemory(dev, &mai, nullptr, &m); a += ms() - t0;
+                t0 = ms(); vkFreeMemory(dev, m, nullptr); f += ms() - t0;
+            }
+            printf("alloc+free %5u KB type%u(%s): alloc %.1f us, free %.1f us\n", sz >> 10, ty, ty == host ? "host" : "local", a * 1000 / R, f * 1000 / R);
+        }
+    // first touch of freshly allocated host memory (page faults)
+    {
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = 8 << 20; mai.memoryTypeIndex = host;
+        double tm = 0;
+        for (int i = 0; i < 20; i++) {
+            VkDeviceMemory m; vkAllocateMemory(dev, &mai, nullptr, &m);
+            void *p; double t0 = ms(); vkMapMemory(dev, m, 0, VK_WHOLE_SIZE, 0, &p); memset(p, 1, 8 << 20); tm += ms() - t0;
+            vkUnmapMemory(dev, m); vkFreeMemory(dev, m, nullptr);
+        }
+        printf("map+first write 8 MB fresh: %.2f ms\n", tm / 20);
+        // correctness: recycled (or fresh) block must be fully usable and keep what we write
+        long bad = 0;
+        for (int i = 0; i < 10; i++) {
+            VkDeviceMemory m; vkAllocateMemory(dev, &mai, nullptr, &m);
+            uint32_t *p; vkMapMemory(dev, m, 0, VK_WHOLE_SIZE, 0, (void **)&p);
+            for (int k = 0; k < (8 << 20) / 4; k += 1024) p[k] = k ^ i;
+            for (int k = 0; k < (8 << 20) / 4; k += 1024) if (p[k] != (uint32_t)(k ^ i)) bad++;
+            if (i & 1) vkUnmapMemory(dev, m);  // free some while still mapped (implicit unmap)
+            vkFreeMemory(dev, m, nullptr);
+        }
+        printf("pool correctness: mismatches=%ld\n", bad);
+    }
+    // descriptor updates
+    VkDescriptorSetLayoutBinding b[4] = {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL},
+                                         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL}, {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL}};
+    VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dl.bindingCount = 4; dl.pBindings = b;
+    VkDescriptorSetLayout dsl; vkCreateDescriptorSetLayout(dev, &dl, nullptr, &dsl);
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2000}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2000}};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpi.maxSets = 1000; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+    VkDescriptorPool dp; vkCreateDescriptorPool(dev, &dpi, nullptr, &dp);
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = 65536; bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VkBuffer buf; vkCreateBuffer(dev, &bi, nullptr, &buf);
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buf, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size; mai.memoryTypeIndex = host;
+    VkDeviceMemory bm; vkAllocateMemory(dev, &mai, nullptr, &bm); vkBindBufferMemory(dev, buf, bm, 0);
+    const int S = 500;
+    VkDescriptorSetLayout layouts[S]; for (int i = 0; i < S; i++) layouts[i] = dsl;
+    VkDescriptorSet sets[S];
+    VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; dsa.descriptorPool = dp; dsa.descriptorSetCount = S; dsa.pSetLayouts = layouts;
+    double t0 = ms(); vkAllocateDescriptorSets(dev, &dsa, sets); double alloc = ms() - t0;
+    VkDescriptorBufferInfo dbi{buf, 0, 256};
+    t0 = ms();
+    for (int i = 0; i < S; i++) {
+        VkWriteDescriptorSet w[4];
+        for (int k = 0; k < 4; k++) { w[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[k].dstSet = sets[i]; w[k].dstBinding = k; w[k].descriptorCount = 1; w[k].descriptorType = b[k].descriptorType; w[k].pBufferInfo = &dbi; }
+        vkUpdateDescriptorSets(dev, 4, w, 0, nullptr);
+    }
+    double upd = ms() - t0;
+    t0 = ms(); vkResetDescriptorPool(dev, dp, 0); double reset = ms() - t0;
+    printf("descriptors: allocate %d sets %.1f us each, update 4 writes %.2f us/set, pool reset %.1f us\n", S, alloc * 1000 / S, upd * 1000 / S, reset * 1000);
+    vkDestroyDevice(dev, nullptr);
+    vkDestroyInstance(inst, nullptr);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 5) { puts("usage: lab <gles|vk> <lib> <conf> <dir>"); return 2; }
     void *h = dlopen(argv[2], RTLD_NOW);
@@ -940,6 +1202,9 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "probe")) return probe_test(conf, argv[4]);
     if (!strcmp(argv[1], "probe2")) return probe2_test(conf, argv[4]);
     if (!strcmp(argv[1], "coexist")) return coexist_test(conf, argv[4]);
+    if (!strcmp(argv[1], "probe3")) return probe3_test(conf, argv[4]);
+    if (!strcmp(argv[1], "probe4")) return probe4_test(conf, argv[4]);
+    if (!strcmp(argv[1], "probe5")) return probe5_test(conf, argv[4]);
     if (!strcmp(argv[1], "occlgl")) return occl_gl_test(conf, argv[4]);
     if (!strcmp(argv[1], "occlvk")) { printf("hooks: %s\n", lab_install(conf, argv[4], "lab.occlvk")); return occl_vk_test(); }
     if (!strcmp(argv[1], "vkidle")) { printf("hooks: %s\n", lab_install(conf, argv[4], "lab.vkidle")); return vkidle_test(); }

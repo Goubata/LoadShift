@@ -80,6 +80,8 @@ private fun App() {
     var device by remember { mutableStateOf<Tuner.Device?>(null) }
     var module by remember { mutableStateOf("…") }
     var foreign by remember { mutableStateOf<List<String>>(emptyList()) }
+    var update by remember { mutableStateOf<UpdateChecker.Release?>(null) }
+    var updateCheck by remember { mutableStateOf(UpdateChecker.enabled(ctx)) }
     var apps by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
     var profiles by remember { mutableStateOf(ProfileStore.all(ctx)) }
     var editing by remember { mutableStateOf<AppEntry?>(null) }
@@ -97,6 +99,9 @@ private fun App() {
         }
         if (serviceOn && !status.running) ShiftService.start(ctx)
     }
+    LaunchedEffect(updateCheck) {
+        if (updateCheck) update = withContext(Dispatchers.IO) { UpdateChecker.check(ctx) }
+    }
     LaunchedEffect(Unit) {
         while (true) { gpu = withContext(Dispatchers.IO) { Tuner.gpuStats() }; delay(1000) }
     }
@@ -113,6 +118,21 @@ private fun App() {
         Text(tr("選んだアプリの CPU 負荷を GPU に委託して FPS を稼ぐ", "Offload CPU work to the GPU in selected apps for higher FPS"),
             fontSize = 13.sp, color = Muted)
         Spacer(Modifier.height(12.dp))
+        update?.let { u ->
+            Card(Modifier.fillMaxWidth().padding(bottom = 10.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF1E3A2C))) {
+                Column(Modifier.padding(14.dp)) {
+                    Text(tr("新しいバージョン v${u.version} が公開されています", "New version v${u.version} is available"),
+                        color = Color.White, fontWeight = FontWeight.SemiBold)
+                    if (u.notes.isNotBlank()) Text(u.notes.take(400), fontSize = 12.sp, color = Color(0xFFBDC1C6), maxLines = 6)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button({ runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(u.url))) } }) {
+                            Text(tr("GitHub で開く", "Open on GitHub"))
+                        }
+                        TextButton({ update = null }) { Text(tr("閉じる", "Dismiss")) }
+                    }
+                }
+            }
+        }
 
         Card(colors = CardDefaults.cardColors(containerColor = CardBg)) {
             Column(Modifier.padding(14.dp)) {
@@ -148,6 +168,10 @@ private fun App() {
                         ProfileStore.setServiceEnabled(ctx, it)
                         if (it) ShiftService.start(ctx) else ShiftService.stop(ctx)
                     })
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(tr("起動時に更新を確認", "Check for updates on launch"), Modifier.weight(1f), color = Color.White, fontSize = 14.sp)
+                    Switch(updateCheck, { updateCheck = it; UpdateChecker.setEnabled(ctx, it); if (!it) update = null })
                 }
                 HelpBlock(HelpText.main())
             }
@@ -334,6 +358,14 @@ private fun Editor(app: AppEntry, existing: Profile?, device: Tuner.Device?, onC
                 tr("シェーダーコンパイル結果を保存・再利用し、CPU のカクつきを削減（実測 20.6→0.06ms/本）",
                    "Stores and reuses compiled pipelines, removing CPU compile hitches (measured 20.6→0.06 ms each)"),
                 p.hookVkCache) { v -> hook { copy(hookVkCache = v) } }
+            Chips(tr("パイプライン並列コンパイル", "Parallel pipeline compilation"), listOf(0, 2, 4, 6), p.pipeSplit,
+                { if (it == 0) tr("オフ", "Off") else tr("${it} スレッド", "$it threads") },
+                tr("まとめて作られるシェーダーを複数コアで同時にコンパイル（実測 474→156ms、約 3 倍速）",
+                   "Compiles batched pipelines on several cores at once (measured 474→156 ms, ~3x)")) { v -> hook { copy(pipeSplit = v) } }
+            Chips(tr("メモリ再利用", "Memory recycling"), listOf(0, 64, 128, 256), p.memPoolMB,
+                { if (it == 0) tr("オフ", "Off") else "$it MB" },
+                tr("解放したメモリを保持して再利用し、確保とページフォルトの停止をなくす（8MB 確保 274→1µs、初回書き込み 1.6→0.2ms）［攻め］",
+                   "Keeps freed memory for reuse, removing allocation and page-fault stalls (8 MB alloc 274→1 µs, first write 1.6→0.2 ms) [aggressive]")) { v -> hook { copy(memPoolMB = v) } }
             Toggle(tr("オクルージョンを待たない", "Don't wait for occlusion"),
                 tr("結果が未完了なら「見えている」と即答（表示は欠けない）。GL でも有効（実測 141→248fps）",
                    "Unfinished queries answer \"visible\" at once (nothing disappears). Also for GL (measured 141→248 fps)"),
@@ -446,6 +478,9 @@ private fun Editor(app: AppEntry, existing: Profile?, device: Tuner.Device?, onC
                 StatusRow("glFlush", tr("省略 ", "dropped ") + "${s["gl_flush_dropped"] ?: 0} / " + tr("実行 ", "issued ") + "${s["gl_flush_real"] ?: 0}", true)
                 StatusRow(tr("非同期 Finish", "Async Finish"), "${s["gl_finish_async"]} (" + tr("待ち合計 ", "total wait ") + "${s["gl_finish_wait_ms"]} ms)", true)
                 StatusRow("Vulkan", "${s["vk_pipelines"]} " + tr("本 平均 ", "pipelines, avg ") + "${s["vk_pipeline_avg_ms"]} ms", true)
+                StatusRow(tr("並列コンパイル", "Parallel compile"), "${s["vk_split_calls"] ?: 0} " + tr("回 / ", "calls / ") + "${s["vk_split_pipelines"] ?: 0} " + tr("本", "pipelines"), true)
+                StatusRow(tr("メモリ再利用", "Memory recycling"), tr("再利用 ", "reused ") + "${s["vk_mem_pool_hits"] ?: 0} / " + tr("新規 ", "new ") +
+                    "${s["vk_mem_pool_misses"] ?: 0} / " + tr("節約 ", "saved ") + "${s["vk_mem_saved_mb"] ?: 0} MB / " + tr("保持中 ", "held ") + "${s["vk_mem_pool_now_mb"] ?: 0} MB", true)
                 StatusRow(tr("キャッシュ", "Cache"), tr("読込 ", "loaded ") + "${s["vk_cache_loaded_kb"] ?: 0} KB / " + tr("保存 ", "saved ") + "${s["vk_cache_saved_kb"] ?: 0} KB", true)
                 StatusRow(tr("ゲーム側キャッシュ", "Game's own cache"), "${s["vk_app_caches"] ?: 0} / " + tr("注入 ", "injected ") + "${s["vk_cache_injected"] ?: 0} / " + tr("統合 ", "merged ") + "${s["vk_cache_merges"] ?: 0}", true)
                 TextButton({ scope.launch(Dispatchers.IO) { Tuner.clearVkCache(app.pkg) } }) { Text(tr("Vulkan キャッシュを削除", "Clear Vulkan cache")) }

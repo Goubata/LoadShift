@@ -17,6 +17,8 @@
 | 遅延 WaitIdle | `vkQueueWaitIdle` / `vkDeviceWaitIdle` を即座に返し、待ちは本当に必要な時点（コマンドバッファ再利用、メモリ読み取り等）まで後回し。破棄は GPU 完了後に専用スレッドが代行 | 104 → 163 fps |
 | パイプライン永続キャッシュ | コンパイル結果を保存して再利用。ゲーム自前のキャッシュ（Unreal / Unity の PSO キャッシュ）も統合・保存し、次回起動時に注入 | 17.8 → 0.06 ms/本 |
 | オクルージョンを待たない | 未完了のオクルージョンクエリを「見えている」と即答（物体は消えない） | — |
+| パイプライン並列コンパイル | まとめて作られるパイプラインを複数コアで同時にコンパイル（ドライバは 1 本ずつ逐次処理） | 48 本 474 → 156 ms |
+| メモリ再利用（攻め） | 解放された VkDeviceMemory を保持して再利用し、カーネル呼び出しとページフォルトをなくす | 8 MB 確保 274 → 1 µs、初回書き込み 1.6 → 0.2 ms |
 
 ### OpenGL ES
 | 機能 | 内容 | 検証環境での実測 |
@@ -39,6 +41,9 @@ lybfghook や Portable GameFX など、同じゲームに入る他のフック�
 - 相手のフックが既にある関数は「LoadShift → 相手 → ドライバ」と連結し、呼び出しを完結させる機能（遅延 WaitIdle・非同期 glFinish など）はその関数だけ相手に譲ります。
 - 相手のコードからの呼び出しは素通しし、相手の読み戻しや待ち合わせの意味を変えません。
 - 他のフックが有効なら、その差し替えを待ってから導入します（自動 / 早い / 遅い を選択可）。
+
+### 更新の確認
+アプリを開くと GitHub の最新リリースを確認し、新しい版があれば知らせます（設定で OFF 可。端末の情報は送りません）。
 
 ### プリセット
 安全 / 標準（既定） / 攻め / 最大。各項目の詳しい説明はアプリ内の「ⓘ 各項目の説明を表示」から見られます。UI は端末の言語が日本語なら日本語、それ以外は英語です。
@@ -88,6 +93,8 @@ A root tool that moves work off the CPU in selected Android apps (mainly games):
 | Lazy WaitIdle | `vkQueueWaitIdle` / `vkDeviceWaitIdle` return at once; the wait is postponed to where it is really needed (command-buffer reuse, memory reads, …). Destruction runs on a helper thread after the GPU is done | 104 → 163 fps |
 | Persistent pipeline cache | Saves and reuses compiled pipelines; the game's own cache (Unreal / Unity PSO caches) is merged, saved and injected back on the next launch | 17.8 → 0.06 ms per pipeline |
 | Don't wait for occlusion | Unfinished occlusion queries answer "visible" immediately (nothing disappears) | — |
+| Parallel pipeline compilation | Batched pipeline creation is split across CPU cores (the driver compiles a batch one by one) | 48 pipelines 474 → 156 ms |
+| Memory recycling (aggressive) | Freed VkDeviceMemory is kept and reused, skipping the kernel call and page faults | 8 MB alloc 274 → 1 µs, first write 1.6 → 0.2 ms |
 
 **OpenGL ES**
 | Feature | What it does | Measured (lab) |
@@ -104,6 +111,8 @@ Numbers come from the synthetic benchmarks in `native/lab.cpp`; real-game gains 
 **System controls** (applied only while the app is in front, restored afterwards): GPU clock floor, CPU boost (uclamp, never below the device default), pinning render threads to big cores. Launch settings: ANGLE switch, Game Mode (resolution scale, FPS limit chosen from the refresh rates read from the device's display).
 
 **Coexistence with other hook modules**: works alongside modules that hook the same game, such as lybfghook or Portable GameFX, without touching their files. Slot locations are computed from the driver file and libGLESv2's code, so load order doesn't matter; where another module already hooks a function the calls are chained (LoadShift → other module → driver), and features that could complete a call on their own (lazy WaitIdle, async glFinish, …) are left to that module for that function. Calls made from the other module's own code pass straight through. When another hook module is active LoadShift installs after it (Auto / Early / Late selectable).
+
+**Update check**: when the app opens it checks the latest GitHub release and shows a notice if a newer version exists (can be turned off; no device information is sent).
 
 **Presets**: Safe / Standard (default) / Aggressive / Max. Every item is explained in the app via "ⓘ Show explanations". The UI is Japanese when the system language is Japanese and English otherwise.
 

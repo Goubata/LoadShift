@@ -63,24 +63,32 @@ data class Profile(
     val compatInstall: Int = 1,      // 0 early, 1 auto, 2 late
     val compatTimeoutMs: Int = 3000,
     val compatExempt: Boolean = true,
+    // more CPU offload
+    val pipeSplit: Int = 4,          // threads for parallel pipeline compilation (0 = off)
+    val memPoolMB: Int = 0,          // VkDeviceMemory recycling pool (0 = off)
 ) {
     val anyHook
-        get() = hookFinish || hookPbo || hookVkCache || hookVkIdle || hookGlBuf || hookOccl || hookReadback || flushUs > 0
+        get() = hookFinish || hookPbo || hookVkCache || hookVkIdle || hookGlBuf || hookOccl || hookReadback || flushUs > 0 ||
+            memPoolMB > 0
 
     /** Applies one of the presets (0 safe, 1 standard, 2 aggressive, 3 max); keeps app/system knobs. */
     fun withPreset(i: Int): Profile = when (i) {
         0 -> copy(preset = 0, hookFinish = true, finishDepth = 1, hookPbo = true, hookVkCache = true, hookVkIdle = true,
             vkIdleLevel = 1, vkIdleDepth = 2, hookGlBuf = true, hookOccl = false, hookReadback = false, flushUs = 0,
-            bufMin = 4096, texMinKB = 256, bufRingMB = 32, texRingMB = 32, copyThreads = 4, copyThresholdKB = 2048)
+            bufMin = 4096, texMinKB = 256, bufRingMB = 32, texRingMB = 32, copyThreads = 4, copyThresholdKB = 2048,
+            pipeSplit = 4, memPoolMB = 0)
         2 -> copy(preset = 2, hookFinish = true, finishDepth = 3, hookPbo = true, hookVkCache = true, hookVkIdle = true,
             vkIdleLevel = 2, vkIdleDepth = 4, hookGlBuf = true, hookOccl = true, hookReadback = true, flushUs = 1000,
-            bufMin = 512, texMinKB = 32, bufRingMB = 64, texRingMB = 64, copyThreads = 4, copyThresholdKB = 1024)
+            bufMin = 512, texMinKB = 32, bufRingMB = 64, texRingMB = 64, copyThreads = 4, copyThresholdKB = 1024,
+            pipeSplit = 4, memPoolMB = 128)
         3 -> copy(preset = 3, hookFinish = true, finishDepth = 3, hookPbo = true, hookVkCache = true, hookVkIdle = true,
             vkIdleLevel = 2, vkIdleDepth = 6, hookGlBuf = true, hookOccl = true, hookReadback = true, flushUs = 2000,
-            bufMin = 256, texMinKB = 16, bufRingMB = 128, texRingMB = 96, copyThreads = 4, copyThresholdKB = 1024)
+            bufMin = 256, texMinKB = 16, bufRingMB = 128, texRingMB = 96, copyThreads = 4, copyThresholdKB = 1024,
+            pipeSplit = 4, memPoolMB = 256)
         else -> copy(preset = 1, hookFinish = true, finishDepth = 2, hookPbo = true, hookVkCache = true, hookVkIdle = true,
             vkIdleLevel = 1, vkIdleDepth = 3, hookGlBuf = true, hookOccl = true, hookReadback = false, flushUs = 0,
-            bufMin = 1024, texMinKB = 64, bufRingMB = 32, texRingMB = 48, copyThreads = 4, copyThresholdKB = 2048)
+            bufMin = 1024, texMinKB = 64, bufRingMB = 32, texRingMB = 48, copyThreads = 4, copyThresholdKB = 2048,
+            pipeSplit = 4, memPoolMB = 0)
     }
 
     fun toJson(): JSONObject = JSONObject()
@@ -95,6 +103,7 @@ data class Profile(
         .put("flushUs", flushUs).put("bufMin", bufMin).put("texMinKB", texMinKB)
         .put("bufRingMB", bufRingMB).put("texRingMB", texRingMB)
         .put("copyThreads", copyThreads).put("copyThresholdKB", copyThresholdKB)
+        .put("pipeSplit", pipeSplit).put("memPoolMB", memPoolMB)
         .put("compatInstall", compatInstall).put("compatTimeoutMs", compatTimeoutMs).put("compatExempt", compatExempt)
 
     companion object {
@@ -129,6 +138,8 @@ data class Profile(
             compatInstall = o.optInt("compatInstall", 1),
             compatTimeoutMs = o.optInt("compatTimeoutMs", 3000),
             compatExempt = o.optBoolean("compatExempt", true),
+            pipeSplit = o.optInt("pipeSplit", 4),
+            memPoolMB = o.optInt("memPoolMB", 0),
         )
     }
 }
