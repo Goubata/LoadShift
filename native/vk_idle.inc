@@ -230,6 +230,7 @@ static void enforce_depth(Dev *x) {
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL my_QueueWaitIdle(VkQueue q) {
+    if (LS_FOREIGN()) return o_QueueWaitIdle(q);  // another module's own wait: keep it exact
     Dev *x = queue_dev(q);
     if (!x || !add_marker(x, q)) {
         uint64_t t0 = now_ns();
@@ -243,6 +244,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_QueueWaitIdle(VkQueue q) {
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL my_DeviceWaitIdle(VkDevice d) {
+    if (LS_FOREIGN()) return o_DeviceWaitIdle(d);
     Dev *x = find_dev(d, false);
     bool ok = x && x->nq > 0;
     if (ok) for (int i = 0; i < x->nq && ok; i++) ok = add_marker(x, x->queues[i]);
@@ -326,7 +328,9 @@ static void wait_cb(VkCommandBuffer cb) {
     bool unknownRisky = !s && g_cbOverflowed;
     pthread_mutex_unlock(&g_cbLock);
     if (unknownRisky) { wait_all_devices(); return; }
-    if (!s) return;
+    // With another graphics hook in the process, a command buffer we never saw submitted may have
+    // been submitted through that module's own driver pointer: be conservative.
+    if (!s) { if (coexist::g_compat) wait_all_devices(); return; }
     for (auto &x : g_devs) {
         if (!x.dev || !has_pending(&x)) continue;
         if (s < x.nextSerial && s > x.doneSerial) wait_upto(&x, s);
@@ -403,6 +407,7 @@ static VkResult occlusion_results(VkDevice d, VkQueryPool p, uint32_t first, uin
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL my_GetQueryPoolResults(VkDevice d, VkQueryPool p, uint32_t a, uint32_t b, size_t s, void *data, VkDeviceSize st, VkQueryResultFlags f) {
+    if (LS_FOREIGN()) { wait_all(find_dev(d, false)); return o_GetQueryPoolResults(d, p, a, b, s, data, st, f); }
     if (g_occlNoWait && is_occlusion(p)) return occlusion_results(d, p, a, b, s, data, st, f);
     wait_all(find_dev(d, false));
     return o_GetQueryPoolResults(d, p, a, b, s, data, st, f);
@@ -587,15 +592,19 @@ static int install(const LoadedLib &drv, int level, int depth, bool idleOn, bool
         bool queryHook = hooks[i].orig == (void **)&o_GetQueryPoolResults || hooks[i].orig == (void **)&o_CreateQueryPool;
         if (!idleOn && !queryHook) continue;  // occlusion-only mode
         wanted++;
-        patched += patch_slots(drv, addr[i], hooks[i].mine) > 0;
+        // Lazy WaitIdle and occlusion answers may complete without calling the next function.
+        bool consuming = hooks[i].orig == (void **)&o_QueueWaitIdle || hooks[i].orig == (void **)&o_DeviceWaitIdle ||
+                         hooks[i].orig == (void **)&o_GetQueryPoolResults;
+        patched += vkH(drv, addr[i], hooks[i].mine, hooks[i].orig, consuming) > 0;
     }
-    if (!idleOn) return patched == wanted ? patched : -patched;
+    if (!idleOn) return patched;
     pthread_t t;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&t, &at, reaper, nullptr);
-    return patched == wanted ? patched : -patched;
+    (void)wanted;
+    return patched;
 }
 #undef QG
 

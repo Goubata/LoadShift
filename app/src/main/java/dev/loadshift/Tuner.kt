@@ -249,9 +249,18 @@ object Tuner {
             append("vk_lazy_idle=${if (p.hookVkIdle) 1 else 0}\n")
             append("vk_idle_level=${p.vkIdleLevel}\n")
             append("vk_idle_depth=${p.vkIdleDepth}\n")
+            append("compat_install=${p.compatInstall}\n")
+            append("compat_timeout_ms=${p.compatTimeoutMs}\n")
+            append("compat_exempt=${if (p.compatExempt) 1 else 0}\n")
         }
         return Root.run("mkdir -p $PROFILE_DIR && chmod 700 /data/adb/loadshift $PROFILE_DIR && printf %s ${Root.q(text)} > ${Root.q(f)} && chmod 600 ${Root.q(f)}").ok
     }
+
+    /** Other in-process graphics hook modules that are installed and enabled. */
+    fun foreignModules(): List<String> = Root.out(
+        "for m in lybfghook portable_gamefx; do d=/data/adb/modules/\$m; " +
+            "[ -d \$d ] && [ ! -f \$d/disable ] && [ ! -f \$d/remove ] && echo \$m; done"
+    )?.lines()?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
 
     fun removeHookConfig(pkg: String) = Root.run("rm -f ${Root.q("$PROFILE_DIR/$pkg.conf")}")
 

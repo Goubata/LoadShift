@@ -131,6 +131,7 @@ static Ring *usable(GLenum target, GLsizeiptr size) {
 }
 
 static void my_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) {
+    if (LS_FOREIGN()) { o_BufferSubData(target, offset, size, data); return; }
     Ring *r = data ? usable(target, size) : nullptr;
     GLsizeiptr at = r ? ring_alloc(r, size) : -1;
     if (at < 0) { if (r) st_fallback++; o_BufferSubData(target, offset, size, data); return; }
@@ -141,6 +142,7 @@ static void my_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, co
 }
 
 static void *my_MapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    if (LS_FOREIGN()) return o_MapBufferRange(target, offset, length, access);
     if (!t_inside && (access & LS_MAP_PERSISTENT) && (access & GL_MAP_READ_BIT)) g_finishUnsafe = true;
     if (!cfg.glBuf) return o_MapBufferRange(target, offset, length, access);
     bool candidate = (access & GL_MAP_WRITE_BIT) && !(access & (GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT | LS_MAP_PERSISTENT)) &&

@@ -1,3 +1,4 @@
+#include <atomic>
 // On-device lab for LoadShift hooks (runs as a plain native process, no Zygisk).
 // usage: lab <gles|vk> <libloadshift.so> <conf-file> <data-dir>
 #include <EGL/egl.h>
@@ -731,17 +732,214 @@ static int probe2_test(const char *conf, const char *dir) {
     return 0;
 }
 
+// ---- coexistence test: emulate another in-process graphics hook module -----------------------
+#include <link.h>
+#include <elf.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+static std::atomic<int> f_finish{0}, f_bsd{0}, f_vkidle{0}, f_vkdestroy{0};
+static void (*fo_finish)();
+static void (*fo_bsd)(GLenum, GLintptr, GLsizeiptr, const void *);
+static VkResult (*fo_vkidle)(VkQueue);
+static void (*fo_vkdestroy)(VkDevice, VkBuffer, const VkAllocationCallbacks *);
+static void fh_finish() { f_finish++; fo_finish(); }
+static void fh_bsd(GLenum t, GLintptr o, GLsizeiptr s, const void *d) { f_bsd++; fo_bsd(t, o, s, d); }
+static VkResult fh_vkidle(VkQueue q) { f_vkidle++; return fo_vkidle(q); }
+static void fh_vkdestroy(VkDevice d, VkBuffer b, const VkAllocationCallbacks *a) { f_vkdestroy++; fo_vkdestroy(d, b, a); }
+
+static long tramp_off(const char *name) {
+    void *lib = dlopen("libGLESv2.so", RTLD_NOW);
+    const uint32_t *ins = (const uint32_t *)dlsym(lib, name);
+    for (int i = 1; ins && i < 10; i++)
+        if (ins[i] == 0xd61f0200u && (ins[i - 1] & 0xFFC003FFu) == 0xF9400210u) return ((ins[i - 1] >> 10) & 0xFFF) * 8;
+    return -1;
+}
+
+// GL: swap the entry in the CURRENT dispatch table (via TLS) — must have a current context.
+static bool foreign_gl(const char *name, void *mine, void **orig) {
+    long off = tramp_off(name);
+    void **tls = (void **)__builtin_thread_pointer();
+    void **table = (void **)tls[4];
+    if (off < 0 || !table) return false;
+    *orig = table[off / 8];
+    table[off / 8] = mine;
+    return true;
+}
+
+struct DrvFind { const char *name; uintptr_t bias; char path[256]; uintptr_t rw[8][2]; int nrw; };
+static int drv_cb(dl_phdr_info *i, size_t, void *d) {
+    DrvFind *f = (DrvFind *)d;
+    if (!i->dlpi_name || !strstr(i->dlpi_name, f->name)) return 0;
+    f->bias = i->dlpi_addr;
+    snprintf(f->path, sizeof(f->path), "%s", i->dlpi_name);
+    for (int k = 0; k < i->dlpi_phnum && f->nrw < 8; k++)
+        if (i->dlpi_phdr[k].p_type == PT_LOAD && (i->dlpi_phdr[k].p_flags & PF_W)) {
+            f->rw[f->nrw][0] = f->bias + i->dlpi_phdr[k].p_vaddr;
+            f->rw[f->nrw][1] = f->rw[f->nrw][0] + i->dlpi_phdr[k].p_memsz;
+            f->nrw++;
+        }
+    return 1;
+}
+static uintptr_t drv_sym(DrvFind &f, const char *sym) {
+    int fd = open(f.path, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    uint8_t *m = (uint8_t *)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    auto *eh = (Elf64_Ehdr *)m;
+    auto *sh = (Elf64_Shdr *)(m + eh->e_shoff);
+    uintptr_t r = 0;
+    for (int i = 0; i < eh->e_shnum && !r; i++) {
+        if (sh[i].sh_type != SHT_DYNSYM) continue;
+        auto *sy = (Elf64_Sym *)(m + sh[i].sh_offset);
+        const char *str = (const char *)(m + sh[sh[i].sh_link].sh_offset);
+        for (size_t k = 0; k < sh[i].sh_size / sizeof(Elf64_Sym); k++)
+            if (!strcmp(str + sy[k].st_name, sym)) { r = f.bias + sy[k].st_value; break; }
+    }
+    munmap(m, st.st_size);
+    return r;
+}
+// Vulkan: classic value scan of the driver's writable/RELRO data for the function pointer.
+static bool foreign_vk(const char *sym, void *mine, void **orig) {
+    DrvFind f{"vulkan.adreno.so"};
+    dl_iterate_phdr(drv_cb, &f);
+    uintptr_t fn = f.bias ? drv_sym(f, sym) : 0;
+    if (!fn) return false;
+    long pg = sysconf(_SC_PAGESIZE);
+    for (int s = 0; s < f.nrw; s++)
+        for (uintptr_t a = f.rw[s][0]; a + 8 <= f.rw[s][1]; a += 8)
+            if (*(uintptr_t *)a == fn) {
+                mprotect((void *)(a & ~(pg - 1)), pg, PROT_READ | PROT_WRITE);
+                *orig = (void *)fn;
+                *(void **)a = mine;
+                return true;
+            }
+    return false;  // not found (e.g. already replaced by someone else)
+}
+
+static int foreign_install() {
+    int ok = 0;
+    ok += foreign_gl("glFinish", (void *)fh_finish, (void **)&fo_finish);
+    ok += foreign_gl("glBufferSubData", (void *)fh_bsd, (void **)&fo_bsd);
+    ok += foreign_vk("_ZN11qglinternal15vkQueueWaitIdleEP9VkQueue_T", (void *)fh_vkidle, (void **)&fo_vkidle);
+    ok += foreign_vk("_ZN11qglinternal15vkDestroyBufferEP10VkDevice_TP10VkBuffer_TPK21VkAllocationCallbacks", (void *)fh_vkdestroy, (void **)&fo_vkdestroy);
+    return ok;
+}
+
+// A thunk in anonymous executable memory: calls x7(x0..x6). Code here counts as "another module".
+typedef void (*Thunk)(...);
+static Thunk make_thunk() {
+    static const uint32_t code[] = {0xa9bf7bfd, 0x910003fd, 0xd63f00e0, 0xa8c17bfd, 0xd65f03c0};  // stp; mov x29,sp; blr x7; ldp; ret
+    void *p = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(p, code, sizeof(code));
+    __builtin___clear_cache((char *)p, (char *)p + sizeof(code));
+    if (mprotect(p, 4096, PROT_READ | PROT_EXEC)) return nullptr;
+    return (Thunk)p;
+}
+
+static const char *(*lab_wait)(int);
+static const char *(*lab_mode)();
+
+static int coexist_test(const char *conf, const char *dir) {
+    const char *order = getenv("LAB_ORDER") ? getenv("LAB_ORDER") : "first";
+    EGLDisplay d = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(d, nullptr, nullptr);
+    EGLint ca[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE};
+    EGLConfig c; EGLint n;
+    eglChooseConfig(d, ca, &c, 1, &n);
+    EGLint sa[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
+    EGLSurface s = eglCreatePbufferSurface(d, c, sa);
+    EGLint xa[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    EGLContext x = eglCreateContext(d, c, EGL_NO_CONTEXT, xa);
+    eglMakeCurrent(d, s, s, x);
+    uint32_t ne = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &ne, nullptr);  // load the Vulkan driver
+    int fok = 0;
+    if (!strcmp(order, "first")) {
+        fok = foreign_install();
+        printf("foreign hooks installed first: %d/4\n", fok);
+        printf("hooks(pending): %s\n", lab_install(conf, dir, "lab.coexist"));
+        printf("hooks: %s\n", lab_wait(10000));
+    } else {  // late: LoadShift waits, the other module arrives 400 ms later
+        printf("hooks(pending): %s\n", lab_install(conf, dir, "lab.coexist"));
+        usleep(400000);
+        fok = foreign_install();
+        printf("foreign hooks installed after start: %d/4\n", fok);
+        printf("hooks: %s\n", lab_wait(10000));
+    }
+    printf("mode: %s\n", lab_mode());
+
+    // GL from the app (trusted): both modules must see their calls.
+    GLuint b; glGenBuffers(1, &b); glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, 4 << 20, nullptr, GL_DYNAMIC_DRAW);
+    static uint8_t data[2 << 20];
+    for (int i = 0; i < 10; i++) glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(data), data);
+    for (int i = 0; i < 20; i++) glFinish();
+    printf("GL  foreign saw: glFinish %d/20, glBufferSubData %d/10\n", f_finish.load(), f_bsd.load());
+
+    // Readback from "another module's" code must stay exact (not one frame late).
+    GLuint rt, fbo;
+    glGenTextures(1, &rt); glBindTexture(GL_TEXTURE_2D, rt);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 64, 64);
+    glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt, 0);
+    Thunk th = make_thunk();
+    int exactForeign = 0, exactApp = 0;
+    for (int f = 1; f <= 6; f++) {
+        glClearColor(f / 10.0f, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+        uint8_t px[4] = {};
+        if (th) th(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px, (void *)glReadPixels);
+        if (px[0] == (uint8_t)(f / 10.0f * 255 + 0.5f)) exactForeign++;
+        glClearColor(f / 10.0f, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+        uint8_t q[4] = {};
+        glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, q);
+        if (q[0] == (uint8_t)(f / 10.0f * 255 + 0.5f)) exactApp++;
+    }
+    printf("readback exact: from other module %d/6 (expect 6), from app %d/6 (async = fewer)\n", exactForeign, exactApp);
+
+    // Vulkan: WaitIdle and destroys must still reach the other module.
+    VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO}; ai.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &ai;
+    VkInstance inst; vkCreateInstance(&ici, nullptr, &inst);
+    uint32_t pc = 1; VkPhysicalDevice pd; vkEnumeratePhysicalDevices(inst, &pc, &pd);
+    float prio = 1;
+    VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qi;
+    VkDevice dev; vkCreateDevice(pd, &dci, nullptr, &dev);
+    VkQueue q; vkGetDeviceQueue(dev, 0, 0, &q);
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = 4096; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    for (int i = 0; i < 5; i++) {
+        vkQueueWaitIdle(q);
+        VkBuffer tmp; vkCreateBuffer(dev, &bi, nullptr, &tmp); vkDestroyBuffer(dev, tmp, nullptr);
+    }
+    usleep(300000);  // let any deferred destroys run
+    printf("VK  foreign saw: vkQueueWaitIdle %d/5, vkDestroyBuffer %d/5\n", f_vkidle.load(), f_vkdestroy.load());
+    vkDestroyDevice(dev, nullptr);
+    vkDestroyInstance(inst, nullptr);
+    lab_flush();
+    eglMakeCurrent(d, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglTerminate(d);
+    bool ok = f_finish == 20 && f_bsd == 10 && exactForeign == 6 && f_vkidle == 5 && f_vkdestroy == 5;
+    printf("COEXIST %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 5) { puts("usage: lab <gles|vk> <lib> <conf> <dir>"); return 2; }
     void *h = dlopen(argv[2], RTLD_NOW);
     if (!h) { printf("dlopen: %s\n", dlerror()); return 2; }
     lab_install = (decltype(lab_install))dlsym(h, "loadshift_lab_install");
     lab_flush = (decltype(lab_flush))dlsym(h, "loadshift_lab_flush");
+    lab_wait = (decltype(lab_wait))dlsym(h, "loadshift_lab_wait");
+    lab_mode = (decltype(lab_mode))dlsym(h, "loadshift_lab_mode");
     const char *conf = slurp(argv[3]);
     if (!strcmp(argv[1], "gles")) return gles(conf, argv[4]);
     if (!strcmp(argv[1], "glbuf")) return glbuf_test(conf, argv[4]);
     if (!strcmp(argv[1], "probe")) return probe_test(conf, argv[4]);
     if (!strcmp(argv[1], "probe2")) return probe2_test(conf, argv[4]);
+    if (!strcmp(argv[1], "coexist")) return coexist_test(conf, argv[4]);
     if (!strcmp(argv[1], "occlgl")) return occl_gl_test(conf, argv[4]);
     if (!strcmp(argv[1], "occlvk")) { printf("hooks: %s\n", lab_install(conf, argv[4], "lab.occlvk")); return occl_vk_test(); }
     if (!strcmp(argv[1], "vkidle")) { printf("hooks: %s\n", lab_install(conf, argv[4], "lab.vkidle")); return vkidle_test(); }

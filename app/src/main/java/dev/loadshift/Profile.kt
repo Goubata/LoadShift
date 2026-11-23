@@ -59,6 +59,10 @@ data class Profile(
     val texRingMB: Int = 48,
     val copyThreads: Int = 4,
     val copyThresholdKB: Int = 2048,
+    // coexistence with other graphics hook modules (lybfghook, Portable GameFX, …)
+    val compatInstall: Int = 1,      // 0 early, 1 auto, 2 late
+    val compatTimeoutMs: Int = 3000,
+    val compatExempt: Boolean = true,
 ) {
     val anyHook
         get() = hookFinish || hookPbo || hookVkCache || hookVkIdle || hookGlBuf || hookOccl || hookReadback || flushUs > 0
@@ -91,6 +95,7 @@ data class Profile(
         .put("flushUs", flushUs).put("bufMin", bufMin).put("texMinKB", texMinKB)
         .put("bufRingMB", bufRingMB).put("texRingMB", texRingMB)
         .put("copyThreads", copyThreads).put("copyThresholdKB", copyThresholdKB)
+        .put("compatInstall", compatInstall).put("compatTimeoutMs", compatTimeoutMs).put("compatExempt", compatExempt)
 
     companion object {
         fun fromJson(o: JSONObject) = Profile(
@@ -121,6 +126,9 @@ data class Profile(
             texRingMB = o.optInt("texRingMB", 48),
             copyThreads = o.optInt("copyThreads", 4),
             copyThresholdKB = o.optInt("copyThresholdKB", 2048),
+            compatInstall = o.optInt("compatInstall", 1),
+            compatTimeoutMs = o.optInt("compatTimeoutMs", 3000),
+            compatExempt = o.optBoolean("compatExempt", true),
         )
     }
 }

@@ -79,6 +79,7 @@ private fun App() {
     val ctx = LocalContext.current
     var device by remember { mutableStateOf<Tuner.Device?>(null) }
     var module by remember { mutableStateOf("…") }
+    var foreign by remember { mutableStateOf<List<String>>(emptyList()) }
     var apps by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
     var profiles by remember { mutableStateOf(ProfileStore.all(ctx)) }
     var editing by remember { mutableStateOf<AppEntry?>(null) }
@@ -91,6 +92,7 @@ private fun App() {
         withContext(Dispatchers.IO) {
             device = Tuner.probe()
             module = Tuner.moduleState()
+            foreign = Tuner.foreignModules()
             apps = loadApps(ctx)
         }
         if (serviceOn && !status.running) ShiftService.start(ctx)
@@ -124,6 +126,8 @@ private fun App() {
                     "missing" -> tr("未導入（/sdcard/Download/LoadShift/ の ZIP を導入）", "Not installed (flash the ZIP in /sdcard/Download/LoadShift/)")
                     else -> module
                 }, module == "installed")
+                if (foreign.isNotEmpty())
+                    StatusRow(tr("他のフック", "Other hooks"), foreign.joinToString(", ") + tr("（共存モード）", " (coexistence mode)"), true)
                 if (d?.root == true) {
                     StatusRow("GPU", "${d.gpuModel}  ${gpu?.let { "${it.first}% / ${it.second} MHz" } ?: ""}", true)
                     StatusRow(tr("高速コア", "Big cores"), "cpu${d.bigCpus}", true)
@@ -382,6 +386,20 @@ private fun Editor(app: AppEntry, existing: Profile?, device: Tuner.Device?, onC
             }
         }
 
+        Section(tr("他のフックとの共存", "Coexistence with other hooks"),
+            tr("lybfghook や Portable GameFX など、同じゲームに入る他のモジュールと両立させる設定（次回起動から）",
+               "Settings for running alongside other modules in the same game, such as lybfghook or Portable GameFX (next launch)"),
+            help = HelpText.coexist()) {
+            Choice(tr("導入タイミング", "Install timing"), listOf(tr("自動", "Auto"), tr("早い", "Early"), tr("遅い", "Late")),
+                listOf(1, 0, 2).indexOf(p.compatInstall).coerceAtLeast(0)) { v -> hook { copy(compatInstall = listOf(1, 0, 2)[v]) } }
+            Chips(tr("他のフックを待つ最大時間", "Max wait for other hooks"), listOf(1000, 3000, 5000, 10000), p.compatTimeoutMs,
+                { "${it / 1000} s" }) { v -> hook { copy(compatTimeoutMs = v) } }
+            Toggle(tr("他モジュール自身の呼び出しは素通し", "Pass other modules' own calls through"),
+                tr("他のフックが自分で行う glFinish・読み戻し・WaitIdle などには LoadShift の処理を適用しません",
+                   "LoadShift leaves glFinish, readbacks, WaitIdle etc. issued by other hook modules untouched"),
+                p.compatExempt) { v -> hook { copy(compatExempt = v) } }
+        }
+
         Section(tr("システム制御 — 前面にいる間だけ", "System control — only while in front"),
             tr("サービスが ON のとき、このアプリが前面の間だけ適用し、離れたら元に戻します", "When the service is on, applied only while this app is in front and restored afterwards"), help = HelpText.system()) {
             Choice(tr("GPU クロック下限", "GPU clock floor"), listOf(tr("オフ", "Off"), tr("中", "Mid"), tr("高", "High"), tr("最大", "Max")), p.gpuFloor) { p = p.copy(gpuFloor = it) }
@@ -415,6 +433,11 @@ private fun Editor(app: AppEntry, existing: Profile?, device: Tuner.Device?, onC
                 fontSize = 12.sp, color = Muted)
             else {
                 StatusRow(tr("フック", "Hooks"), s["hooks"] ?: "-", true)
+                StatusRow(tr("共存", "Coexistence"), "${s["compat"] ?: "-"} / " + tr("他フック ", "other hook ") +
+                    (if (s["foreign_module"] == "1") tr("あり", "yes") else tr("なし", "no")), true)
+                StatusRow(tr("検出・譲渡", "Found / yielded"), tr("他フック検出 ", "foreign slots ") + "${s["foreign_slots"] ?: 0} / " +
+                    tr("譲った ", "yielded ") + "${s["yielded_slots"] ?: 0} / " + tr("素通し ", "passed through ") + "${s["foreign_calls"] ?: 0}", true)
+                StatusRow(tr("ドライバ", "Driver"), s["driver_copies"] ?: "-", s["driver_copies"].let { it == null || it == "vk1/gl1" || it.contains("vk0") || it.contains("gl0") })
                 StatusRow(tr("遅延 WaitIdle", "Lazy WaitIdle"), "${s["vk_idle_skipped"] ?: 0} (" + tr("後払い待ち ", "deferred wait ") + "${s["vk_lazy_wait_ms"] ?: 0} ms / " + tr("破棄代行 ", "deferred destroys ") + "${s["vk_deferred_destroys"] ?: 0})", true)
                 StatusRow(tr("オクルージョン", "Occlusion"), "GL ${s["occl_gl_answered"] ?: 0} / VK ${s["occl_vk_answered"] ?: 0}", true)
                 StatusRow(tr("バッファ GPU 化", "GPU buffer copies"), "${s["gl_buf_sub"] ?: 0}+${s["gl_buf_map"] ?: 0} / ${s["gl_buf_sub_mb"] ?: 0}+${s["gl_buf_map_mb"] ?: 0} MB", true)

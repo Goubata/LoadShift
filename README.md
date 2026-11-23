@@ -33,6 +33,13 @@
 ### システム制御（前面にいる間だけ適用・離れたら復元）
 GPU クロック下限、CPU ブースト（uclamp、端末既定値より下げない）、描画スレッドの高速コア固定。起動時設定として ANGLE 切替、Game Mode（解像度スケール・端末から読み取ったリフレッシュレートによる FPS 指定）。
 
+### 他のフックモジュールとの共存
+lybfghook や Portable GameFX など、同じゲームに入る他のフックモジュールと両立します（相手のファイルには触れません）。
+- 差し替える場所をドライバファイルと libGLESv2 の命令列から割り出すため、読み込み順に関係なく見つけられます。
+- 相手のフックが既にある関数は「LoadShift → 相手 → ドライバ」と連結し、呼び出しを完結させる機能（遅延 WaitIdle・非同期 glFinish など）はその関数だけ相手に譲ります。
+- 相手のコードからの呼び出しは素通しし、相手の読み戻しや待ち合わせの意味を変えません。
+- 他のフックが有効なら、その差し替えを待ってから導入します（自動 / 早い / 遅い を選択可）。
+
 ### プリセット
 安全 / 標準（既定） / 攻め / 最大。各項目の詳しい説明はアプリ内の「ⓘ 各項目の説明を表示」から見られます。UI は端末の言語が日本語なら日本語、それ以外は英語です。
 
@@ -95,6 +102,8 @@ A root tool that moves work off the CPU in selected Android apps (mainly games):
 Numbers come from the synthetic benchmarks in `native/lab.cpp`; real-game gains vary per game.
 
 **System controls** (applied only while the app is in front, restored afterwards): GPU clock floor, CPU boost (uclamp, never below the device default), pinning render threads to big cores. Launch settings: ANGLE switch, Game Mode (resolution scale, FPS limit chosen from the refresh rates read from the device's display).
+
+**Coexistence with other hook modules**: works alongside modules that hook the same game, such as lybfghook or Portable GameFX, without touching their files. Slot locations are computed from the driver file and libGLESv2's code, so load order doesn't matter; where another module already hooks a function the calls are chained (LoadShift → other module → driver), and features that could complete a call on their own (lazy WaitIdle, async glFinish, …) are left to that module for that function. Calls made from the other module's own code pass straight through. When another hook module is active LoadShift installs after it (Auto / Early / Late selectable).
 
 **Presets**: Safe / Standard (default) / Aggressive / Max. Every item is explained in the app via "ⓘ Show explanations". The UI is Japanese when the system language is Japanese and English otherwise.
 

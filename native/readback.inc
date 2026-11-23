@@ -54,6 +54,7 @@ static Slot *lookup(EGLContext c, GLint fbo, GLint rb, GLint x, GLint y, GLsizei
 }
 
 static void my_ReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void *out) {
+    if (LS_FOREIGN()) { o_ReadPixels(x, y, w, h, format, type, out); return; }
     GlCtx *g = (!t_inside && out && w > 0 && h > 0) ? cur_ctx() : nullptr;
     int bpp = g && g->es3 == 1 ? bytes_per_pixel(format, type) : 0;
     GLint packBuf = 0;

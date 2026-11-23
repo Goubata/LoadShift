@@ -102,6 +102,27 @@ object HelpText {
             "Copies smaller than this use a single thread. Lower = medium textures are copied in parallel too."),
     )
 
+    fun coexist() = listOf(
+        i("何が問題だったか", "What the problem was",
+            "lybfghook などのフレーム生成モジュールも、LoadShift と同じくゲーム内でグラフィックス関数を横取りします。どちらが先に読み込まれるかは root 環境で変わり、後から入った側が先に入った側の差し替えを見つけられず、片方（または両方）が効かなくなることがありました。",
+            "Frame-generation modules such as lybfghook intercept graphics functions inside the game just like LoadShift. Which one loads first depends on the root setup, and the later one could miss the earlier one's changes, so one (or both) stopped working."),
+        i("LoadShift の対処", "How LoadShift handles it",
+            "差し替える場所をドライバファイルと libGLESv2 の命令列から割り出すので、相手が先に書き換えていても見つけられます。相手のフックが既にある関数は「LoadShift → 相手 → ドライバ」と連結し、呼び出しを完結させてしまう機能（遅延 WaitIdle・非同期 glFinish など）はその関数だけ相手に譲ります。相手のモジュールのコードからの呼び出しは素通しします。相手のファイルには一切触れません。",
+            "Slot locations are computed from the driver file and libGLESv2's code, so they are found even if the other module changed them first. Where the other module already hooks a function, calls are chained LoadShift → other module → driver, and features that could complete a call on their own (lazy WaitIdle, async glFinish, …) are left to the other module for that function only. Calls made by the other module's own code pass straight through. The other module's files are never touched."),
+        i("導入タイミング", "Install timing",
+            "自動: 他のフックモジュールが有効なら、それが差し替えを終えるのを待ってから入ります（無ければすぐ入る）。早い: アプリ起動直後に入ります。遅い: 常に他のフックを待ちます。どちらか片方が効かない時は「早い」と「遅い」を切り替えて試してください。",
+            "Auto: if another hook module is active, LoadShift waits until it has finished patching (otherwise it installs at once). Early: installs right at app start. Late: always waits for other hooks. If one of the two still doesn't work, try switching between Early and Late."),
+        i("他のフックを待つ最大時間", "Max wait for other hooks",
+            "相手の差し替えが見つからない時に待つ上限です。短いほどゲームの起動処理を取りこぼしにくく、長いほど起動の遅い相手にも合わせられます。",
+            "How long to wait when the other module's changes are not seen. Shorter catches more of the game's startup; longer accommodates modules that install late."),
+        i("他モジュール自身の呼び出しは素通し", "Pass other modules' own calls through",
+            "フレーム生成モジュールが自分で行う読み戻しや待ち合わせに、1 フレーム遅れの読み戻しや非同期化を適用しないようにします。通常は ON のままにしてください。",
+            "Keeps 1-frame-late readback or async waits away from the frame-generation module's own work. Leave it on unless told otherwise."),
+        i("統計の見方", "Reading the stats",
+            "共存: early（すぐ導入）/ late:after-other-hook（相手を待ってから導入）/ late:other-hook-already-there（相手が先にいた）/ late:timeout。検出＝相手が既に差し替えていた箇所、譲った＝相手に任せた関数、素通し＝相手のコードからの呼び出し回数。ドライバが vk2 や gl2 の場合、ドライバが複数読み込まれており、報告時に役立ちます。",
+            "Coexistence: early / late:after-other-hook / late:other-hook-already-there / late:timeout. Found = slots the other module had already changed, yielded = functions left to it, passed through = calls from its code. Driver vk2 or gl2 means the driver is loaded more than once — useful in bug reports."),
+    )
+
     fun system() = listOf(
         i("GPU クロック下限", "GPU clock floor",
             "アプリが前面の間、GPU の最低クロックを引き上げます。GPU の立ち上がりが速くなり、CPU が GPU を待つ時間が減ります。高くするほど電池消費と発熱が増えます。",

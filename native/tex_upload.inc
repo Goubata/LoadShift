@@ -215,6 +215,7 @@ static PFN_CTexSubImage2D o_CTexSubImage2D;
 #define OFS(x) ((const void *)(uintptr_t)(x))
 
 static void my_TexImage2D(GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum ty, const void *px) {
+    if (LS_FOREIGN()) { o_glTexImage2D(t, l, ifmt, w, h, b, f, ty, px); return; }
     Ring *r;
     int64_t len = px && smart_ok(f, ty) ? span(w, h, 1, f, ty) : -1;
     GLsizeiptr at = len > 0 ? stage(px, len, &r) : -1;
@@ -224,6 +225,7 @@ static void my_TexImage2D(GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei h, G
 }
 
 static void my_TexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum ty, const void *px) {
+    if (LS_FOREIGN()) { o_glTexSubImage2D(t, l, x, y, w, h, f, ty, px); return; }
     Ring *r;
     int64_t len = px && smart_ok(f, ty) ? span(w, h, 1, f, ty) : -1;
     GLsizeiptr at = len > 0 ? stage(px, len, &r) : -1;
@@ -233,6 +235,7 @@ static void my_TexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLs
 }
 
 static void my_TexImage3D(GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei h, GLsizei d, GLint b, GLenum f, GLenum ty, const void *px) {
+    if (LS_FOREIGN()) { o_TexImage3D(t, l, ifmt, w, h, d, b, f, ty, px); return; }
     Ring *r;
     int64_t len = px && smart_ok(f, ty) ? span(w, h, d, f, ty) : -1;
     GLsizeiptr at = len > 0 ? stage(px, len, &r) : -1;
@@ -242,6 +245,7 @@ static void my_TexImage3D(GLenum t, GLint l, GLint ifmt, GLsizei w, GLsizei h, G
 }
 
 static void my_TexSubImage3D(GLenum t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, GLenum f, GLenum ty, const void *px) {
+    if (LS_FOREIGN()) { o_TexSubImage3D(t, l, x, y, z, w, h, d, f, ty, px); return; }
     Ring *r;
     int64_t len = px && smart_ok(f, ty) ? span(w, h, d, f, ty) : -1;
     GLsizeiptr at = len > 0 ? stage(px, len, &r) : -1;
@@ -251,6 +255,7 @@ static void my_TexSubImage3D(GLenum t, GLint l, GLint x, GLint y, GLint z, GLsiz
 }
 
 static void my_CTexImage2D(GLenum t, GLint l, GLenum ifmt, GLsizei w, GLsizei h, GLint b, GLsizei size, const void *data) {
+    if (LS_FOREIGN()) { o_CTexImage2D(t, l, ifmt, w, h, b, size, data); return; }
     Ring *r;
     GLsizeiptr at = size > 0 ? stage(data, size, &r) : -1;
     if (at < 0) { o_CTexImage2D(t, l, ifmt, w, h, b, size, data); return; }
@@ -260,6 +265,7 @@ static void my_CTexImage2D(GLenum t, GLint l, GLenum ifmt, GLsizei w, GLsizei h,
 }
 
 static void my_CTexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLsizei size, const void *data) {
+    if (LS_FOREIGN()) { o_CTexSubImage2D(t, l, x, y, w, h, f, size, data); return; }
     Ring *r;
     GLsizeiptr at = size > 0 ? stage(data, size, &r) : -1;
     if (at < 0) { o_CTexSubImage2D(t, l, x, y, w, h, f, size, data); return; }

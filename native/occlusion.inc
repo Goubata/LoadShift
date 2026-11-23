@@ -37,11 +37,13 @@ static const Rec *find(GLuint id) {
 }
 
 static void my_BeginQuery(GLenum target, GLuint id) {
+    if (LS_FOREIGN()) { o_BeginQuery(target, id); return; }
     if (id) remember(id, target);
     o_BeginQuery(target, id);
 }
 
 static void my_GetQueryObjectuiv(GLuint id, GLenum pname, GLuint *out) {
+    if (LS_FOREIGN()) { o_GetQueryObjectuiv(id, pname, out); return; }
     if (pname == GL_QUERY_RESULT && out) {
         const Rec *q = find(id);
         GLenum t = q ? q->target : 0;

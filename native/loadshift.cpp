@@ -65,6 +65,11 @@ struct Config {
     int copyThresholdKB = 2048;
     bool glBuf = false;
     int glBufMin = 1024;
+    // coexistence with other graphics hook modules
+    int compatInstall = 1;    // 0 early (at app start), 1 auto, 2 late (after other hooks)
+    int compatTimeoutMs = 3000;
+    bool foreignFg = false;   // set by the companion: another graphics hook module is active
+    bool exemptForeign = true;
 };
 static Config cfg;
 static char g_dir[512];   // <app data>/cache/loadshift
@@ -74,7 +79,7 @@ static std::atomic<uint64_t> st_finish{0}, st_finishWaitNs{0}, st_finishNative{0
 static std::atomic<uint64_t> st_pbo{0}, st_pboBytes{0}, st_pboSkip{0};
 static std::atomic<uint64_t> st_vkPipes{0}, st_vkPipeNs{0}, st_vkImplicit{0}, st_vkSeeded{0};
 static std::atomic<uint64_t> st_vkSaved{0}, st_vkLoaded{0};
-static char st_hooks[256] = "none";
+static char st_hooks[320] = "none";
 static std::atomic<bool> g_dirty{false};
 
 static uint64_t now_ns() {
@@ -114,6 +119,10 @@ static void parse_config(const char *text) {
                 else if (!strcmp(line, "gl_tex_ring_mb")) cfg.texRingMB = v < 16 ? 16 : (v > 192 ? 192 : v);
                 else if (!strcmp(line, "copy_threads")) cfg.copyThreads = v < 1 ? 1 : (v > 8 ? 8 : v);
                 else if (!strcmp(line, "copy_threshold_kb")) cfg.copyThresholdKB = v < 64 ? 64 : v;
+                else if (!strcmp(line, "compat_install")) cfg.compatInstall = v < 0 ? 0 : (v > 2 ? 2 : v);
+                else if (!strcmp(line, "compat_timeout_ms")) cfg.compatTimeoutMs = v < 200 ? 200 : (v > 30000 ? 30000 : v);
+                else if (!strcmp(line, "foreign_fg")) cfg.foreignFg = v;
+                else if (!strcmp(line, "compat_exempt")) cfg.exemptForeign = v;
                 else if (!strcmp(line, "gl_buffer_min")) cfg.glBufMin = v < 0 ? 0 : v;
             }
         }
@@ -141,7 +150,7 @@ static bool write_atomic(const char *name, const void *data, size_t len) {
 
 static int extra_stats(char *b, size_t cap);
 static void write_stats() {
-    char b[3200];
+    char b[4000];
     uint64_t f = st_finish.load(), pipes = st_vkPipes.load();
     int n = snprintf(b, sizeof(b),
         "pkg=%s\npid=%d\nhooks=%s\n"
@@ -250,6 +259,18 @@ static int patch_slots(const LoadedLib &L, void *from, void *to) {
     return n;
 }
 
+#include "coexist.inc"
+
+// Hook a Vulkan driver function: slots from the driver file (order-independent, chains onto an
+// existing foreign hook); falls back to value scanning. *orig receives what to call next.
+static int vkH(const LoadedLib &drv, void *fn, void *mine, void **orig, bool consuming = false) {
+    int n = coexist::vk_hook(drv, fn, mine, orig, consuming);
+    if (n < 0) { __atomic_store_n(orig, fn, __ATOMIC_RELEASE); return 0; }  // yielded to another hook
+    if (n) return n;
+    __atomic_store_n(orig, fn, __ATOMIC_RELEASE);
+    return patch_slots(drv, fn, mine);
+}
+
 // ---------------------------------------------------------------------------------------------
 // GLES
 
@@ -309,6 +330,7 @@ static std::atomic<uint32_t> g_finishEpoch{1};
 static std::atomic<bool> g_finishUnsafe{false};
 
 static void my_glFinish() {
+    if (LS_FOREIGN()) { o_glFinish(); return; }
     g_finishEpoch++;
     GlCtx *g = cfg.glFinish && !g_finishUnsafe.load() ? cur_ctx() : nullptr;
     if (!g || g->es3 != 1) { st_finishNative++; o_glFinish(); return; }
@@ -375,6 +397,7 @@ static int live_contexts() {
 }
 
 static void my_Flush() {
+    if (LS_FOREIGN()) { o_Flush(); return; }
     uint64_t now = now_ns();
     if (!g_fenced.load() && live_contexts() <= 1 && now - t_last < (uint64_t)cfg.flushUs * 1000) { st_dropped++; return; }
     g_fenced = false;
@@ -384,6 +407,7 @@ static void my_Flush() {
 }
 
 static GLsync my_FenceSync(GLenum c, GLbitfield f) {
+    if (LS_FOREIGN()) return o_FenceSync(c, f);
     g_fenced = true;
     return o_FenceSync(c, f);
 }
@@ -399,17 +423,18 @@ static void on_ctx(int idx, bool fresh) {
     if (fresh || (t.ok && !glIsBuffer(t.buf))) t = texup::Ring();
 }
 
-static int install_gles(char *log, size_t cap) {
-    // Make sure the driver is loaded (zygote normally preloads it already).
+static int install_gles(char *log, size_t cap, bool mayLoadDriver) {
     void *egl = dlopen("libEGL.so", RTLD_NOW);
     if (!egl) return 0;
     p_eglGetCurrentContext = (decltype(p_eglGetCurrentContext))dlsym(egl, "eglGetCurrentContext");
     auto getDisplay = (EGLDisplay(*)(EGLNativeDisplayType))dlsym(egl, "eglGetDisplay");
     LoadedLib drv;
-    if (!find_lib("libGLESv2_adreno.so", &drv) && getDisplay) getDisplay(EGL_DEFAULT_DISPLAY);
+    // Zygote normally preloads the driver; only force-load it when installing early.
+    if (!find_lib("libGLESv2_adreno.so", &drv) && getDisplay && mayLoadDriver) getDisplay(EGL_DEFAULT_DISPLAY);
     if (!find_lib("libGLESv2_adreno.so", &drv)) { snprintf(log, cap, "gles:no-adreno "); return 0; }
     LoadedLib eglLib;
     if (!find_lib("libEGL.so", &eglLib)) return 0;
+    coexist::g_glCopies = coexist::count_loaded("libGLESv2_adreno.so");
     const char *names[] = {"glFinish", "glTexImage2D", "glTexSubImage2D",
                            "glBufferSubData", "glMapBufferRange", "glFlushMappedBufferRange", "glUnmapBuffer",
                            "glTexImage3D", "glTexSubImage3D", "glCompressedTexImage2D", "glCompressedTexSubImage2D",
@@ -422,65 +447,63 @@ static int install_gles(char *log, size_t cap) {
     texup::g_copyThreshold = (size_t)cfg.copyThresholdKB * 1024;
     auto gpa = (void *(*)(const char *))dlsym(egl, "eglGetProcAddress");
     glbuf::p_BufferStorageEXT = gpa ? (glbuf::PFN_BufferStorageEXT)gpa("glBufferStorageEXT") : nullptr;
+
+    // Slot location by trampoline decoding (works even if another module already swapped the
+    // slot); falls back to value scanning when the layout can't be decoded.
+    bool layout = coexist::gl_find_bases(drv);
+    // Hooks that can complete a call without calling the next function.
+    // GL hooks transform calls (GPU copies, PBO offsets, async answers), so all of them yield
+    // to an existing foreign hook except BeginQuery / FenceSync, which always pass through as-is.
+    auto consuming = [](int k) { return !(k == 11 || k == 15); };
+    auto H = [&](int k, void *mine, void **orig) -> int {
+        if (!addr[k]) return 0;
+        if (layout) {
+            int n = coexist::gl_hook(names[k], addr[k], mine, orig, consuming(k));
+            if (n < 0) { __atomic_store_n(orig, addr[k], __ATOMIC_RELEASE); return 0; }  // yielded
+            if (n) return n;
+        }
+        __atomic_store_n(orig, addr[k], __ATOMIC_RELEASE);
+        return patch_slots(eglLib, addr[k], mine);
+    };
     int nf = 0, ni = 0, ns = 0;
-    if (cfg.glFinish && addr[0]) { o_glFinish = (PFN_Finish)addr[0]; nf = patch_slots(eglLib, addr[0], (void *)my_glFinish); }
+    if (cfg.glFinish) nf = H(0, (void *)my_glFinish, (void **)&o_glFinish);
     if (cfg.pbo && addr[1] && addr[2]) {
         texup::g_mode = cfg.pbo;
         texup::g_minKB = cfg.pboMinKB;
-        o_glTexImage2D = (PFN_TexImage2D)addr[1];
-        o_glTexSubImage2D = (PFN_TexSubImage2D)addr[2];
-        ni = patch_slots(eglLib, addr[1], (void *)texup::my_TexImage2D);
-        ns = patch_slots(eglLib, addr[2], (void *)texup::my_TexSubImage2D);
+        ni = H(1, (void *)texup::my_TexImage2D, (void **)&o_glTexImage2D);
+        ns = H(2, (void *)texup::my_TexSubImage2D, (void **)&o_glTexSubImage2D);
         if (addr[7] && addr[8]) {
-            texup::o_TexImage3D = (texup::PFN_TexImage3D)addr[7];
-            texup::o_TexSubImage3D = (texup::PFN_TexSubImage3D)addr[8];
-            ni += patch_slots(eglLib, addr[7], (void *)texup::my_TexImage3D);
-            ns += patch_slots(eglLib, addr[8], (void *)texup::my_TexSubImage3D);
+            ni += H(7, (void *)texup::my_TexImage3D, (void **)&texup::o_TexImage3D);
+            ns += H(8, (void *)texup::my_TexSubImage3D, (void **)&texup::o_TexSubImage3D);
         }
         if (addr[9] && addr[10]) {
-            texup::o_CTexImage2D = (texup::PFN_CTexImage2D)addr[9];
-            texup::o_CTexSubImage2D = (texup::PFN_CTexSubImage2D)addr[10];
-            ni += patch_slots(eglLib, addr[9], (void *)texup::my_CTexImage2D);
-            ns += patch_slots(eglLib, addr[10], (void *)texup::my_CTexSubImage2D);
+            ni += H(9, (void *)texup::my_CTexImage2D, (void **)&texup::o_CTexImage2D);
+            ns += H(10, (void *)texup::my_CTexSubImage2D, (void **)&texup::o_CTexSubImage2D);
         }
     }
     int nb = 0;
     if (cfg.glBuf && addr[3] && addr[4] && addr[5] && addr[6]) {
         glbuf::g_min = cfg.glBufMin;
-        glbuf::o_BufferSubData = (glbuf::PFN_BufferSubData)addr[3];
-        glbuf::o_MapBufferRange = (glbuf::PFN_MapBufferRange)addr[4];
-        glbuf::o_FlushMappedBufferRange = (glbuf::PFN_FlushMappedBufferRange)addr[5];
-        glbuf::o_UnmapBuffer = (glbuf::PFN_UnmapBuffer)addr[6];
-        // Install the passthrough-capable hooks only if all four slots are found.
-        int c3 = patch_slots(eglLib, addr[3], (void *)glbuf::my_BufferSubData);
-        int c4 = patch_slots(eglLib, addr[4], (void *)glbuf::my_MapBufferRange);
-        int c5 = patch_slots(eglLib, addr[5], (void *)glbuf::my_FlushMappedBufferRange);
-        int c6 = patch_slots(eglLib, addr[6], (void *)glbuf::my_UnmapBuffer);
-        nb = (c3 > 0) + (c4 > 0) + (c5 > 0) + (c6 > 0);
+        nb = (H(3, (void *)glbuf::my_BufferSubData, (void **)&glbuf::o_BufferSubData) > 0) +
+             (H(4, (void *)glbuf::my_MapBufferRange, (void **)&glbuf::o_MapBufferRange) > 0) +
+             (H(5, (void *)glbuf::my_FlushMappedBufferRange, (void **)&glbuf::o_FlushMappedBufferRange) > 0) +
+             (H(6, (void *)glbuf::my_UnmapBuffer, (void **)&glbuf::o_UnmapBuffer) > 0);
     } else if (cfg.glFinish && addr[4] && addr[5] && addr[6]) {
-        // Map hooks only as a watchdog for persistent READ maps (keeps async glFinish safe).
-        glbuf::o_MapBufferRange = (glbuf::PFN_MapBufferRange)addr[4];
+        // Map hook only as a watchdog for persistent READ maps (keeps async glFinish safe).
         glbuf::o_FlushMappedBufferRange = (glbuf::PFN_FlushMappedBufferRange)addr[5];
         glbuf::o_UnmapBuffer = (glbuf::PFN_UnmapBuffer)addr[6];
-        patch_slots(eglLib, addr[4], (void *)glbuf::my_MapBufferRange);
+        H(4, (void *)glbuf::my_MapBufferRange, (void **)&glbuf::o_MapBufferRange);
     }
     int no = 0;
-    if (cfg.occl && addr[11] && addr[12]) {
-        occl::o_BeginQuery = (occl::PFN_BeginQuery)addr[11];
-        occl::o_GetQueryObjectuiv = (occl::PFN_GetQueryObjectuiv)addr[12];
-        no = (patch_slots(eglLib, addr[11], (void *)occl::my_BeginQuery) > 0) + (patch_slots(eglLib, addr[12], (void *)occl::my_GetQueryObjectuiv) > 0);
-    }
+    if (cfg.occl && addr[11] && addr[12])
+        no = (H(11, (void *)occl::my_BeginQuery, (void **)&occl::o_BeginQuery) > 0) +
+             (H(12, (void *)occl::my_GetQueryObjectuiv, (void **)&occl::o_GetQueryObjectuiv) > 0);
     int nr = 0, nfl = 0;
-    if (cfg.readback && addr[13]) {
-        rback::o_ReadPixels = (rback::PFN_ReadPixels)addr[13];
-        nr = patch_slots(eglLib, addr[13], (void *)rback::my_ReadPixels) > 0;
-    }
-    if (cfg.flushUs > 0 && addr[14] && addr[15]) {
-        gflush::o_Flush = (gflush::PFN_Flush)addr[14];
-        gflush::o_FenceSync = (gflush::PFN_FenceSync)addr[15];
-        nfl = (patch_slots(eglLib, addr[14], (void *)gflush::my_Flush) > 0) + (patch_slots(eglLib, addr[15], (void *)gflush::my_FenceSync) > 0);
-    }
-    snprintf(log, cap, "gles:finish%d,tex%d/%d,buf%d/4,occl%d/2,rb%d,flush%d/2 ", nf, ni, ns, nb, no, nr, nfl);
+    if (cfg.readback) nr = H(13, (void *)rback::my_ReadPixels, (void **)&rback::o_ReadPixels) > 0;
+    if (cfg.flushUs > 0 && addr[14] && addr[15])
+        nfl = (H(14, (void *)gflush::my_Flush, (void **)&gflush::o_Flush) > 0) +
+              (H(15, (void *)gflush::my_FenceSync, (void **)&gflush::o_FenceSync) > 0);
+    snprintf(log, cap, "gles%s:finish%d,tex%d/%d,buf%d/4,occl%d/2,rb%d,flush%d/2 ", layout ? "" : "(scan)", nf, ni, ns, nb, no, nr, nfl);
     return nf + ni + ns + nb + no + nr + nfl;
 }
 
@@ -703,7 +726,8 @@ static int install_vulkan(char *log, size_t cap) {
     o_DestroyDevice = (PFN_vkDestroyDevice)a[5];
     int idle = 0;
     if (cfg.vkIdle || cfg.occl) idle = vkidle::install(drv, cfg.vkIdleLevel, cfg.vkIdleDepth, cfg.vkIdle, cfg.occl);
-    int nd = patch_slots(drv, a[5], (void *)my_DestroyDevice);
+    coexist::g_vkCopies = coexist::count_loaded("vulkan.adreno.so");
+    int nd = vkH(drv, a[5], (void *)my_DestroyDevice, (void **)&o_DestroyDevice);
     if (!cfg.vkCache) { snprintf(log, cap, "vk:idle%d,dd%d ", idle, nd); return idle + nd; }
     o_CreatePipelineCache = (PFN_vkCreatePipelineCache)a[0];
     o_DestroyPipelineCache = (PFN_vkDestroyPipelineCache)a[1];
@@ -711,10 +735,10 @@ static int install_vulkan(char *log, size_t cap) {
     o_CreateGraphicsPipelines = (PFN_vkCreateGraphicsPipelines)a[3];
     o_CreateComputePipelines = (PFN_vkCreateComputePipelines)a[4];
     load_blob();
-    int n0 = patch_slots(drv, a[0], (void *)my_CreatePipelineCache);
-    int n1 = patch_slots(drv, a[1], (void *)my_DestroyPipelineCache);
-    int n3 = patch_slots(drv, a[3], (void *)my_CreateGraphicsPipelines);
-    int n4 = patch_slots(drv, a[4], (void *)my_CreateComputePipelines);
+    int n0 = vkH(drv, a[0], (void *)my_CreatePipelineCache, (void **)&o_CreatePipelineCache);
+    int n1 = vkH(drv, a[1], (void *)my_DestroyPipelineCache, (void **)&o_DestroyPipelineCache);
+    int n3 = vkH(drv, a[3], (void *)my_CreateGraphicsPipelines, (void **)&o_CreateGraphicsPipelines);
+    int n4 = vkH(drv, a[4], (void *)my_CreateComputePipelines, (void **)&o_CreateComputePipelines);
     snprintf(log, cap, "vk:cache%d%d%d%d%s,idle%d,dd%d ", n0, n1, n3, n4, o_MergePipelineCaches ? "+merge" : "", idle, nd);
     return n0 + n1 + n3 + n4 + nd + (idle > 0 ? idle : 0);
 }
@@ -733,6 +757,89 @@ static void *stats_thread(void *) {
 }
 
 static bool g_installed;
+static std::atomic<bool> g_hooksReady{false};
+
+static void do_install(bool mayLoadDriver) {
+    char a[128] = "", b[128] = "";
+    if (cfg.glFinish || cfg.pbo || cfg.glBuf || cfg.occl || cfg.readback || cfg.flushUs) install_gles(a, sizeof(a), mayLoadDriver);
+    if (cfg.vkCache || cfg.vkIdle || cfg.occl) install_vulkan(b, sizeof(b));
+    snprintf(st_hooks, sizeof(st_hooks), "%s%s", a, b);
+    LOG("%s: %s [%s]", g_pkg, st_hooks, coexist::g_mode);
+    g_hooksReady = true;
+    write_stats();
+}
+
+// Wait for another graphics hook module to finish patching (or a timeout), then install on top
+// of it. Watches the dispatch slots LoadShift will use plus the entry code of the graphics
+// libraries' key exports, so table swaps and inline hooks are both noticed.
+static void *late_install_thread(void *) {
+    pthread_setname_np(pthread_self(), "LoadShiftLate");
+    uint64_t t0 = now_ns();
+    LoadedLib gdrv, vdrv, lib;
+    if (find_lib("libGLESv2_adreno.so", &gdrv) && coexist::gl_find_bases(gdrv)) {
+        static const char *gl[] = {"glFinish", "glTexImage2D", "glTexSubImage2D", "glBufferSubData", "glMapBufferRange",
+                                   "glUnmapBuffer", "glReadPixels", "glFlush", "glGetQueryObjectuiv", "glBeginQuery"};
+        const int NG = sizeof(gl) / sizeof(gl[0]);
+        void *ga[NG] = {};
+        resolve_syms(gdrv, gl, ga, NG);
+        for (int k = 0; k < NG; k++) {
+            long off = coexist::gl_offset(gl[k]);
+            for (int i = 0; off >= 0 && ga[k] && i < coexist::g_nGlBases; i++) coexist::watch_slot(coexist::g_glBases[i] + off, ga[k]);
+        }
+    }
+    if (!find_lib("vulkan.adreno.so", &vdrv)) {
+        void *vk = dlopen("libvulkan.so", RTLD_NOW);
+        auto enumExt = vk ? (PFN_vkEnumerateInstanceExtensionProperties)dlsym(vk, "vkEnumerateInstanceExtensionProperties") : nullptr;
+        uint32_t n = 0;
+        if (enumExt) enumExt(nullptr, &n, nullptr);
+    }
+    if (find_lib("vulkan.adreno.so", &vdrv)) {
+        static const char *vs[] = {
+            "_ZN11qglinternal13vkQueueSubmitEP9VkQueue_TjPK12VkSubmitInfoP9VkFence_T",
+            "_ZN11qglinternal15vkQueueWaitIdleEP9VkQueue_T",
+            "_ZN11qglinternal16vkDeviceWaitIdleEP10VkDevice_T",
+            "_ZN11qglinternal16vkGetDeviceQueueEP10VkDevice_TjjPP9VkQueue_T",
+            "_ZN11qglinternal19vkGetDeviceProcAddrEP10VkDevice_TPKc",
+            "_ZN11qglinternal21vkGetInstanceProcAddrEP12VkInstance_TPKc",
+            "_ZN11qglinternal25vkCreateGraphicsPipelinesEP10VkDevice_TP17VkPipelineCache_TjPK28VkGraphicsPipelineCreateInfoPK21VkAllocationCallbacksPP12VkPipeline_T",
+            "_ZN11qglinternal21vkCreatePipelineCacheEP10VkDevice_TPK25VkPipelineCacheCreateInfoPK21VkAllocationCallbacksPP17VkPipelineCache_T",
+        };
+        const int N = sizeof(vs) / sizeof(vs[0]);
+        void *fa[N] = {};
+        resolve_syms(vdrv, vs, fa, N);
+        for (int i = 0; i < N; i++) {
+            if (!fa[i]) continue;
+            coexist::watch_add((uintptr_t)fa[i], 16);  // inline hook on the driver function
+            uintptr_t sl[8];
+            int n = coexist::vk_slot_addrs(vdrv, fa[i], sl, 8);
+            for (int k = 0; k < n; k++) coexist::watch_slot(sl[k], fa[i]);  // table swap
+        }
+    }
+    struct Ex { const char *lib; const char *fns[8]; };
+    static const Ex exports[] = {
+        {"libvulkan.so", {"vkGetDeviceProcAddr", "vkGetInstanceProcAddr", "vkCreateDevice", "vkCreateInstance",
+                          "vkQueuePresentKHR", "vkQueueSubmit", "vkCreateSwapchainKHR", "vkAcquireNextImageKHR"}},
+        {"libEGL.so", {"eglSwapBuffers", "eglSwapBuffersWithDamageKHR", "eglGetProcAddress", "eglMakeCurrent",
+                       "eglCreateWindowSurface", "eglCreateContext", nullptr, nullptr}},
+    };
+    for (auto &e : exports) {
+        if (!find_lib(e.lib, &lib)) continue;
+        void *fa[8] = {};
+        int cnt = 0;
+        while (cnt < 8 && e.fns[cnt]) cnt++;
+        resolve_syms(lib, e.fns, fa, cnt);
+        for (int i = 0; i < cnt; i++) coexist::watch_add((uintptr_t)fa[i], 16);
+    }
+    const char *why = "timeout";
+    if (coexist::g_preModified) why = "other-hook-already-there";  // it went first: install now
+    else while (now_ns() - t0 < (uint64_t)cfg.compatTimeoutMs * 1000000ull) {
+        if (coexist::watch_changed()) { why = "after-other-hook"; usleep(300000); break; }
+        usleep(50000);
+    }
+    snprintf(coexist::g_mode, sizeof(coexist::g_mode), "late:%s:%llums", why, (unsigned long long)((now_ns() - t0) / 1000000));
+    do_install(false);
+    return nullptr;
+}
 
 static void install(const char *dataDir) {
     if (g_installed || !cfg.enabled) return;
@@ -742,23 +849,29 @@ static void install(const char *dataDir) {
     snprintf(parent, sizeof(parent), "%s/cache", dataDir);
     mkdir(parent, 0700);
     mkdir(g_dir, 0700);
-    char a[96] = "", b[96] = "";
-    if (cfg.glFinish || cfg.pbo || cfg.glBuf || cfg.occl || cfg.readback || cfg.flushUs) install_gles(a, sizeof(a));
-    if (cfg.vkCache || cfg.vkIdle || cfg.occl) install_vulkan(b, sizeof(b));
-    snprintf(st_hooks, sizeof(st_hooks), "%s%s", a, b);
-    LOG("%s: %s", g_pkg, st_hooks);
-    write_stats();
+    bool late = cfg.compatInstall == 2 || (cfg.compatInstall == 1 && cfg.foreignFg);
+    coexist::g_compat = cfg.foreignFg || late;
+    coexist::g_exempt = cfg.exemptForeign;
+    if (coexist::g_compat) coexist::init_callers();
     pthread_t t;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (late) {
+        pthread_create(&t, &at, late_install_thread, nullptr);
+    } else {
+        snprintf(coexist::g_mode, sizeof(coexist::g_mode), "early");
+        do_install(true);
+    }
     pthread_create(&t, &at, stats_thread, nullptr);
 }
 
 static int extra_stats(char *b, size_t cap) {
     return snprintf(b, cap,
-        "vk_app_caches=%llu\nvk_cache_injected=%llu\nvk_cache_merges=%llu\ngl_tex_compressed=%llu\ngl_buf_sub=%llu\ngl_buf_sub_mb=%.1f\ngl_buf_map=%llu\ngl_buf_map_mb=%.1f\ngl_buf_fallback=%llu\n"
+        "compat=%s\nforeign_module=%d\nforeign_slots=%llu\nyielded_slots=%llu\nforeign_calls=%llu\ndriver_copies=vk%d/gl%d\nvk_app_caches=%llu\nvk_cache_injected=%llu\nvk_cache_merges=%llu\ngl_tex_compressed=%llu\ngl_buf_sub=%llu\ngl_buf_sub_mb=%.1f\ngl_buf_map=%llu\ngl_buf_map_mb=%.1f\ngl_buf_fallback=%llu\n"
         "gl_readback_async=%llu\ngl_readback_exact=%llu\ngl_flush_dropped=%llu\ngl_flush_real=%llu\noccl_gl_answered=%llu\noccl_vk_answered=%llu\nvk_idle_skipped=%llu\nvk_idle_native_ms=%.1f\nvk_lazy_waits=%llu\nvk_lazy_wait_ms=%.1f\nvk_deferred_destroys=%llu\n",
+        coexist::g_mode, cfg.foreignFg ? 1 : 0, (unsigned long long)coexist::st_foreignSlots.load(),
+        (unsigned long long)coexist::st_yielded.load(), (unsigned long long)coexist::st_foreignCalls.load(), coexist::g_vkCopies, coexist::g_glCopies,
         (unsigned long long)st_vkAppCaches.load(), (unsigned long long)st_vkInjected.load(), (unsigned long long)st_vkMerges.load(),
         (unsigned long long)texup::st_compressed.load(), (unsigned long long)glbuf::st_sub.load(), glbuf::st_subBytes.load() / 1048576.0,
         (unsigned long long)glbuf::st_map.load(), glbuf::st_mapBytes.load() / 1048576.0,
@@ -779,6 +892,11 @@ extern "C" __attribute__((visibility("default"))) const char *loadshift_lab_inst
     return st_hooks;
 }
 extern "C" __attribute__((visibility("default"))) void loadshift_lab_flush() { flush_implicit(); write_stats(); }
+extern "C" __attribute__((visibility("default"))) const char *loadshift_lab_wait(int ms) {
+    for (int i = 0; i < ms / 10 && !g_hooksReady.load(); i++) usleep(10000);
+    return st_hooks;
+}
+extern "C" __attribute__((visibility("default"))) const char *loadshift_lab_mode() { return coexist::g_mode; }
 
 // ---------------------------------------------------------------------------------------------
 // Zygisk
@@ -816,6 +934,24 @@ static void companion(int client) {
             close(fd);
             if (n > 0) len = (uint32_t)n;
         }
+    }
+    // Tell the app process whether another in-process graphics hook module is active, so it
+    // can install after it and leave that module's own calls untouched.
+    if (len) {
+        static const char *known[] = {"lybfghook", "portable_gamefx"};
+        bool active = false;
+        for (auto *m : known) {
+            char d[160], x[200];
+            snprintf(d, sizeof(d), "/data/adb/modules/%s", m);
+            struct stat st;
+            if (stat(d, &st) || !S_ISDIR(st.st_mode)) continue;
+            snprintf(x, sizeof(x), "%s/disable", d);
+            if (!access(x, F_OK)) continue;
+            snprintf(x, sizeof(x), "%s/remove", d);
+            if (!access(x, F_OK)) continue;
+            active = true;
+        }
+        if (active && len + 16 < sizeof(buf)) len += snprintf(buf + len, sizeof(buf) - len, "\nforeign_fg=1\n");
     }
     xfer(client, &len, sizeof(len), true);
     if (len) xfer(client, buf, len, true);
